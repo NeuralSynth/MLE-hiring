@@ -9,6 +9,9 @@ env/
 # Environment
 .env
 
+#tests
+code/tests/
+
 # IDE
 .vscode/
 .idea/
@@ -24,3 +27,5 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+.pytest_cache/
+/HANDOFF.md
