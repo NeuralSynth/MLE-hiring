@@ -41,11 +41,12 @@ support_tickets.csv
         │
         ▼
    [STAGE 4: RETRIEVER]                                 retriever.py
-   BM25 on product_area subfolder ONLY
-   Query = Subject + ticket_text combined for richer signal
-   Index built ONCE at startup; YAML frontmatter stripped
-   Excludes trap/deprecated files via EXCLUDED_FILES list
-   Output: top-5 docs (path, cleaned_content, score)
+   Chunk-level BM25 on product_area subfolder ONLY
+   Tokenizer: alphanumeric split + stopword removal (query+index)
+   Docs cleaned (frontmatter / URLs / Related Articles stripped),
+     header-aware chunked, enriched with title+breadcrumb+slug
+   Relevance floor (relative) + max chunks/doc
+   Output: top-k chunks (path, content, score)
         │
         ▼
    [STAGE 5: ESCALATION GATE]                           escalation.py
@@ -103,9 +104,14 @@ support_tickets.csv
   1. **Determinism**: BM25 uses exact term statistics; the index is fully reproducible across runs.
   2. **Speed**: Index built once at startup; all searches are in-process with zero network calls.
   3. **No dependencies**: No embedding API keys, rate limits, or network calls required.
-- **Frontmatter stripping**: YAML frontmatter (`---...---`) in Markdown files was leaking verbatim into LLM responses and causing hallucinated metadata citations. All content is stripped at index build time using `clean_content()`.
-- **Excluded files**: A `EXCLUDED_FILES` set blocks trap/deprecated/off-topic documents from ever being returned (e.g. deprecated API reference, wrong-domain Visa files, generic index files that matched everything).
-- **Query construction**: `Subject + ticket_text` combined for BM25 — this gives more signal than ticket content alone and surfaces specific articles over generic index files.
+- **Tokenization**: alphanumeric split (`[a-z0-9]+`) plus stopword removal, applied symmetrically to the index and the query. Fixes punctuation gluing (`api.` ≠ `api`) and stops common words (how/do/i/my) from dominating BM25 scoring.
+- **Content cleaning** (`clean_content`): strips YAML frontmatter, link URLs (keeps anchor text), bare URLs, `Related Articles` blocks, and the `_Last updated_` line — so a document is not credited for topics it only *links* to, and YAML no longer leaks into responses.
+- **Header-aware chunking**: each file is split by markdown headers into passages (small sections merged, sections over ~320 words window-split with overlap, headings kept inline). 85% of corpus docs exceed the ~190-word embedding/scoring sweet spot, so whole-doc indexing previously truncated/diluted them; chunking gives focused units and a smaller generator context.
+- **Index enrichment**: the document title, frontmatter breadcrumbs, and the filename slug are added to a chunk's BM25 tokens (not the displayed content), surfacing the right article for question-style queries.
+- **Relevance gate**: hits below a relative floor (a fraction of the top score) are dropped and chunks-per-document are capped, so the long tail of marginal matches never reaches the generator.
+- **Query construction**: `Subject + ticket_text` combined for BM25 — more signal than ticket content alone.
+- **Excluded files**: a `EXCLUDED_FILES` set blocks trap/deprecated/off-topic documents from every area's index.
+- **Known limitation**: retrieval still searches only the classified `product_area` (hard gate); a soft cross-area prior and an optional local semantic re-rank are deferred.
 
 ### Escalation Gate (`escalation.py`)
 - **Rules-first rationale**: Hardcoded rules cannot be bypassed by adversarial prompts or LLM hallucination. Legal, GDPR, and fraud cases must *always* escalate regardless of LLM opinion.
