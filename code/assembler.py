@@ -1,6 +1,21 @@
 import json
 from config import ROOT
 
+# Accurate, reason-specific justifications for escalated tickets (keyed by the
+# `reason` returned from should_escalate).
+ESCALATION_JUSTIFICATIONS = {
+    "critical_risk": "Escalated automatically: the ticket was triaged as critical risk and needs human review.",
+    "legal_terms": "Escalated automatically: legal or compliance language was detected, which must be handled by a human specialist.",
+    "human_request": "Escalated automatically: the customer explicitly asked to reach a human or supervisor.",
+    "pii_financial": "Escalated automatically: personal data combined with a financial request requires manual identity verification.",
+    "vague_out_of_scope": "Escalated automatically: the request is too vague or out of scope to resolve from the support documentation.",
+    "no_docs": "Escalated automatically: no matching support documentation was found for this request.",
+    "weak_retrieval": "Escalated automatically: the available documentation does not sufficiently cover this request.",
+    "supervisor_llm": "Escalated by supervisor assessment: the request exceeds automated capabilities or requires manual verification.",
+    "generator_unresolved": "Escalated: the request could not be resolved from the available support documentation.",
+}
+_DEFAULT_ESCALATION = "Escalated by supervisor assessment because the request exceeds automated capabilities or requires manual verification."
+
 def calculate_confidence(
     is_adv: bool,
     escalated: bool,
@@ -11,33 +26,31 @@ def calculate_confidence(
     source_documents: str,
     ticket_text: str
 ) -> float:
-    if is_adv:
-        return 0.99
-    if request_type == "invalid":
-        return 1.0
-        
-    # Check if we have a clean FAQ match
-    if not escalated and source_documents:
+    # A correct, grounded answer is the most confident outcome.
+    if not is_adv and not escalated and request_type != "invalid" and source_documents:
         return 0.95
-        
+
+    # Confident *decisions* that are rejections, not resolutions.
+    if is_adv:
+        return 0.90
+    if request_type == "invalid" and not escalated:
+        return 0.90
+
+    # Escalations are a safe hand-off, not a resolution. (Checked before the
+    # ungrounded-reply fallback, and after invalid, so an escalated 'invalid'
+    # ticket uses the escalation confidence rather than reporting 1.0.)
     if escalated:
-        if escalated_by_rules:
-            return 0.80
-        else:
-            return 0.70
-            
-    # Fallback calculation
-    base_score = 0.85
-    modifiers = 0.0
-    
+        return 0.80 if escalated_by_rules else 0.70
+
+    # Replied without a grounded source — least certain.
+    score = 0.70
     if product_area == "none":
-        modifiers -= 0.05
+        score -= 0.05
     if language != "en":
-        modifiers -= 0.05
+        score -= 0.05
     if len(ticket_text.split()) < 20:
-        modifiers -= 0.15
-        
-    return max(0.60, min(1.0, base_score + modifiers))
+        score -= 0.15
+    return max(0.60, score)
 
 def assemble(
     row: dict,
@@ -47,11 +60,12 @@ def assemble(
     escalate: bool,
     escalated_by_rules: bool,
     generated: dict,
-    ticket_text: str
+    ticket_text: str,
+    escalation_reason: str = ""
 ) -> dict:
     # 1. Map status and request_type
     status = "escalated" if escalate else "replied"
-    request_type = classification.get("request_type", "product_issue")
+    request_type = classification.get("request_type", "product_issue").lower()
     product_area = classification.get("product_area", "none")
     language = classification.get("language", "en")
     
@@ -68,10 +82,7 @@ def assemble(
         actions = []
         source_docs = ""
     elif escalate:
-        if escalated_by_rules:
-            justification = "Escalated by automated compliance rules (e.g. legal terms detected, critical risk, PII with financial request, or vague out-of-scope query)."
-        else:
-            justification = "Escalated by supervisor assessment because the request exceeds automated capabilities or requires manual verification."
+        justification = ESCALATION_JUSTIFICATIONS.get(escalation_reason, _DEFAULT_ESCALATION)
     else:
         if source_docs:
             justification = f"Answered from the support corpus using document: {source_docs}."
@@ -96,7 +107,7 @@ def assemble(
     except Exception:
         actions_str = "[]"
         
-    # 5. Build output dictionary conforming exactly to output.csv lowercase schema
+    # 5. Build output dictionary conforming exactly to validator's lowercase snake_case schema
     output_row = {
         "issue": row.get("Issue", ""),
         "subject": row.get("Subject", ""),
@@ -108,7 +119,7 @@ def assemble(
         "justification": justification,
         "confidence_score": round(confidence, 2),
         "source_documents": source_docs,
-        "risk_level": classification.get("risk_level", "low"),
+        "risk_level": classification.get("risk_level", "low").lower(),
         "pii_detected": "true" if pii_detected else "false",
         "language": language,
         "actions_taken": actions_str
