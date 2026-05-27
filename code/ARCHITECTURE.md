@@ -1,28 +1,74 @@
 # Support Triage Agent Architecture
 
-This document details the design, pipeline flow, and technical implementation of the terminal-based multi-domain support triage agent.
+This document details the design, pipeline flow, and technical implementation of the multi-domain support triage agent.
 
 ---
 
 ## 1. High-Level Architecture Flow
 
-The agent utilizes a **Sequential Pipeline** design pattern. Rather than using an agent loop (which is prone to non-determinism and instruction-hijacking), the ticket is passed through a sequence of pure functional stages:
+The agent uses a **Sequential Pipeline** design rather than an agent loop. Tickets pass through a sequence of deterministic stages with exactly 3 LLM calls per ticket maximum.
 
-```mermaid
-graph TD
-    A[Input ticket] --> B[Parse Ticket]
-    B --> C[Safety Screener]
-    C -- Adversarial --> D[Direct Escalation]
-    C -- Safe --> E[PII Detector]
-    E --> F[Classifier]
-    F --> G[BM25 Retriever]
-    G --> H[Escalation Gate]
-    H -- Escalate --> I[Escalation Response]
-    H -- Reply --> J[Grounded Response Generator]
-    I --> K[Assembler]
-    J --> K
-    D --> K
-    K --> L[output.csv]
+```
+support_tickets.csv
+        │
+        ▼
+   [PARSE TICKET]
+   Extract Issue JSON → conversation turns (single and multi-turn)
+   Extract Subject, Company — Company treated as hint only
+        │
+        ▼
+   [STAGE 1: SAFETY SCREENER]                           safety.py
+   De-obfuscate: NFKC + strip zero-width, decode base64/hex,
+     flatten homoglyphs (rule-matching copy only)
+   Deterministic injection rules (override / role-change /
+     exfiltration / formula / multilingual) → short-circuit
+   Else hardened LLM call → "safe" | "adversarial"
+   If adversarial → STOP: write hardcoded escalation row
+        │
+        ▼
+   [STAGE 2: PII DETECTOR + REDACTION]                  pii.py
+   Regex only — no LLM, deterministic
+   Detects: emails, phones, credit cards (Luhn), SSNs, addresses
+   Redacts PII to placeholders ([EMAIL], [CARD ****1234], ...)
+     before any LLM call; card/phone keep last 4 digits
+   Output: pii_detected (bool) + redacted text for the LLM stages
+        │
+        ▼
+   [STAGE 3: CLASSIFIER]                                classifier.py
+   Single LLM call → JSON
+   Output: product_area, request_type, risk_level, language
+   Infers product_area from content, NOT from Company field
+        │
+        ▼
+   [STAGE 4: RETRIEVER]                                 retriever.py
+   BM25 on product_area subfolder ONLY
+   Query = Subject + ticket_text combined for richer signal
+   Index built ONCE at startup; YAML frontmatter stripped
+   Excludes trap/deprecated files via EXCLUDED_FILES list
+   Output: top-5 docs (path, cleaned_content, score)
+        │
+        ▼
+   [STAGE 5: ESCALATION GATE]                           escalation.py
+   Rules-first — LLM cannot override hardcoded rules:
+     - risk_level = critical
+     - legal keyword in ticket text
+     - pii_detected=True AND financial word in ticket text
+     - product_area="none" AND ticket < 20 words
+     - retrieved_chunks is empty
+   LLM only for ambiguous cases after rules pass
+        │
+        ▼
+   [STAGE 6: RESPONSE GENERATOR]                        generator.py
+   If escalate=True  → escalation message + escalate_to_human action
+   If escalate=False → grounded response from cleaned chunks only
+   Output: response, actions_taken (list), source_documents (path str)
+        │
+        ▼
+   [STAGE 7: OUTPUT ASSEMBLER]                          assembler.py
+   Validates: json.loads(actions_taken) succeeds
+   Validates: source_documents path exists on disk or is empty string
+   Calculates: confidence_score deterministically (no LLM)
+   Writes: one complete row with all OUTPUT_COLUMNS in correct case
 ```
 
 ---
@@ -30,82 +76,117 @@ graph TD
 ## 2. Component Breakdown
 
 ### Safety Screener (`safety.py`)
-- **Purpose**: Prevent prompt injections and adversarial system prompts leakage.
-- **Approach**: Dedicated LLM call using `temperature=0` and a strict classification prompt.
-- **Why**: By screening *before* retrieval or classification, we eliminate the risk of adversarial prompts manipulating downstream retrieval queries or formatting logic. If flagged as `adversarial`, the pipeline immediately stops and outputs a standard escalation row.
+- **Purpose**: Prevent prompt injection and system-prompt / document leakage, including obfuscated and non-English attacks.
+- **Defense in depth (de-obfuscate → rules → LLM):**
+  1. **Normalize** — Unicode NFKC plus stripping of zero-width / control characters, defeating full-width look-alikes and invisible-character keyword splitting (e.g. zero-width spaces inserted mid-word).
+  2. **Decode** — base64 and hex segments that decode to readable text are appended to the screened text, so payloads hidden in encodings/binaries become visible. Segments that decode to noise (ordinary words, IDs, card numbers) are discarded.
+  3. **Deterministic rules** — high-precision regexes for instruction override, role/persona change, data exfiltration, output manipulation, and spreadsheet-formula injection, plus a curated multilingual phrase backstop. Matching runs on a homoglyph-flattened, de-accented copy (Cyrillic/Greek look-alikes → Latin) so `Ignоre` (Cyrillic `о`) is caught. A rule match short-circuits to `adversarial` — the model cannot override it.
+  4. **LLM screener** — runs on the de-obfuscated text for novel / nuanced / multilingual cases the rules don't cover; it is the primary multilingual detector. Temperature `0`.
+- **Why before retrieval**: screening first eliminates the risk of adversarial prompts manipulating downstream logic. If flagged as `adversarial`, the pipeline immediately stops and writes a canned escalation row — the failure mode is safe, so over-detection cannot leak.
+- **Homoglyph flattening is applied only to the rule-matching copy**, never to the text sent to the LLM, so genuine non-Latin (e.g. Russian, Chinese) tickets are screened intact.
 
 ### PII Detector (`pii.py`)
-- **Purpose**: Detect personal data and prevent echoing it back to the user.
-- **Approach**: Pure regex checks covering emails, SSNs, phone numbers, credit card numbers (validated with the Luhn checksum), and physical street/ZIP addresses.
-- **Why**: Doing this without LLM calls guarantees 100% deterministic, high-speed execution and removes the risk of LLMs ignoring PII guidelines.
+- **Purpose**: Detect personal data and prevent it from reaching the model or the output.
+- **Approach**: Pure regex — emails, SSNs, phone numbers, credit card numbers (Luhn checksum), physical addresses.
+- **Why no LLM**: Guarantees 100% deterministic, zero-latency execution. LLMs can hallucinate PII or miss it; regex cannot be prompted into changing its behavior.
+- **Redaction (preventive, not just detective)**: `redact_pii()` masks every detected span before the ticket reaches any LLM (safety, classifier, escalation, generator) and therefore before anything is written to the output. Raw PII is never sent to the model or echoed back — a deterministic guarantee instead of trusting the LLM's "don't echo PII" instruction. Credit cards and phones keep their last 4 digits (`[CARD ****1234]`) so the agent can still reference "your card ending 1234"; emails, SSNs and addresses are fully masked. The local BM25 retrieval query still uses the raw text (no network), and the output `issue` column preserves the original ticket.
+- **One engine**: `detect_pii()` and `redact_pii()` share `_scrub()`, so the `pii_detected` flag can never disagree with what was masked.
 
 ### Classifier (`classifier.py`)
-- **Purpose**: Identify the ticket metadata (company, specific product area, request type, risk level, and language).
-- **Approach**: Structured JSON classification using the LLM client. Ignores the `company` hint on the ticket if it contradicts the text body.
+- **Purpose**: Identify ticket metadata — product area, request type, risk level, language.
+- **Approach**: Structured JSON classification via LLM at `temperature=0`.
+- **Key constraint**: Ignores the `Company` field hint if it contradicts ticket text content.
 
 ### BM25 Retriever (`retriever.py`)
-- **Purpose**: Retrieve support context documents from the local corpus.
-- **Approach**: Custom tokenization and BM25 Okapi search.
-- **Why BM25 over Vector DB**:
-  1. **Determinism**: BM25 relies on exact term statistics; its index is fully reproducible.
-  2. **Latency**: Indexing is done once at startup in microseconds; search is entirely local and does not invoke external embedding API endpoints, keeping execution well below the 3-minute challenge limit.
-  3. **No Key Dependencies**: Avoids rate-limits or key expiration failures.
+- **Purpose**: Retrieve relevant support documentation from the local corpus.
+- **Why BM25 over vector DB**:
+  1. **Determinism**: BM25 uses exact term statistics; the index is fully reproducible across runs.
+  2. **Speed**: Index built once at startup; all searches are in-process with zero network calls.
+  3. **No dependencies**: No embedding API keys, rate limits, or network calls required.
+- **Frontmatter stripping**: YAML frontmatter (`---...---`) in Markdown files was leaking verbatim into LLM responses and causing hallucinated metadata citations. All content is stripped at index build time using `clean_content()`.
+- **Excluded files**: A `EXCLUDED_FILES` set blocks trap/deprecated/off-topic documents from ever being returned (e.g. deprecated API reference, wrong-domain Visa files, generic index files that matched everything).
+- **Query construction**: `Subject + ticket_text` combined for BM25 — this gives more signal than ticket content alone and surfaces specific articles over generic index files.
 
 ### Escalation Gate (`escalation.py`)
-- **Purpose**: Triage high-risk or sensitive cases.
-- **Approach**: **Rules-First, LLM-Second**.
-  - Hardcoded rules immediately trigger escalation for:
-    - Critical risk level.
-    - Legal keywords (e.g. lawsuit, GDPR, court).
-    - PII detected in combination with billing/payment actions.
-    - Vague/unclear tickets.
-    - Missing matching documents.
-  - If rules do not trigger, a fallback LLM call decides on ambiguous tickets.
+- **Rules-first rationale**: Hardcoded rules cannot be bypassed by adversarial prompts or LLM hallucination. Legal, GDPR, and fraud cases must *always* escalate regardless of LLM opinion.
+- **LLM as second pass**: Used only on genuinely ambiguous tickets that clear all rules — where escalation is a judgment call, not a compliance requirement.
 
 ### Response Generator (`generator.py`)
-- **Purpose**: Compose the customer response and tool triggers.
-- **Approach**: Instructs the LLM to ground the answer strictly in retrieved documents. It injects the tool schemas from `internal_tools.json` and generates `verify_identity` challenges for unverified destructive requests.
+- **Purpose**: Compose the customer response and trigger tool calls.
+- **Approach**: Grounds the answer strictly in retrieved documents. Injects `internal_tools.json` schemas.
+- **`verify_identity` guardrail**: Only triggered when ALL of: (1) account-level action requested, (2) involves money/access changes, (3) no prior verification in conversation. Specifically NOT triggered for general information questions, status inquiries, or non-modifying configuration queries.
+- **Escalation action preservation**: `escalate_to_human` actions generated by the LLM are passed through as-is; they are never cleared after generation.
 
 ### Assembler (`assembler.py`)
-- **Purpose**: Serialize outputs and calculate the confidence score.
-- **Approach**: Formats all fields to conform to `validate_output.py` enums. It calculates confidence using a rule-based formula rather than LLM self-assessment:
-  - Invalid tickets = `1.0`
-  - Adversarial tickets = `0.99`
-  - Clean FAQ match = `0.95`
-  - Rule-based escalation = `0.80`
-  - LLM-based escalation = `0.70`
+- **Purpose**: Serialize outputs and compute confidence score.
+- **Confidence is deterministic** — never asked from the LLM (LLMs routinely self-report `0.99` regardless of evidence quality):
+  - `invalid` request type → `1.0`
+  - Adversarial detected → `0.99`
+  - Clean FAQ match with source doc → `0.95`
+  - Rule-based escalation → `0.80`
+  - LLM-based escalation → `0.70`
 
 ---
 
-## 3. Self-Assessment & Limitations
+## 3. LLM Configuration
 
-### Expected Performance (1-10 Scale)
-- **Adversarial Robustness**: `10/10`. The pre-screener isolates the rest of the pipeline from adversarial injections.
-- **Escalation Precision**: `9/10`. Rules-first approach covers all major compliance edge cases.
-- **PII Detection**: `9.5/10`. Luhn verification prevents false positives while maintaining broad regex coverage.
-- **Source Attribution**: `9/10`. Citations are strictly validated for existence before output.
-- **Confidence Calibration**: `8.5/10`. Rule-based scores reflect true pipeline certainty.
+The agent supports multiple providers via environment variables, requiring no code changes to switch:
 
-### Known Limitations
-- **BM25 Semantic Gap**: BM25 might miss relevant articles if the ticket uses completely different terminology (e.g. "cancel" vs "terminate"). This is mitigated by retrieving the top 5 documents to capture broader matches.
-- **Vague Multilingual Inputs**: Very short non-English tickets might be harder to classify correctly.
+| Provider       | Config                   | Notes                                                                                       |
+|----------------|--------------------------|---------------------------------------------------------------------------------------------|
+| Ollama (local) | `LLM_PROVIDER=ollama`    | Requires Ollama running at `localhost:11434`. Uses `qwen3.6` or any tag from `ollama list`. |
+| Groq           | `LLM_PROVIDER=groq`      | Fast remote inference. Use `llama-3.3-70b-versatile`.                                       |
+| Anthropic      | `LLM_PROVIDER=anthropic` | Requires `ANTHROPIC_API_KEY`.                                                               |
+| OpenAI         | `LLM_PROVIDER=openai`    | Requires `OPENAI_API_KEY`.                                                                  |
+
+**Why Ollama + Qwen3**: Local inference avoids API costs and rate limits during development. `temperature=0` on all calls maximizes output determinism. Qwen3's chain-of-thought `<think>...</think>` blocks are stripped by `clean_json_response()` before any `json.loads()` call.
 
 ---
 
-## 4. Local Models & Offline Testing
+## 4. Output Schema
 
-To support offline testing and development without API key rate limits or network latency, the agent implements a multi-provider strategy configuration in `.env`:
+```python
+OUTPUT_COLUMNS = [
+    "issue", "subject", "company",
+    "response", "product_area", "status", "request_type",
+    "justification", "confidence_score", "source_documents",
+    "risk_level", "pii_detected", "language", "actions_taken"
+]
+```
 
-### Local LLM Integration
-- **Providers**: `local` or `ollama`.
-- **Implementation**: Routes request payloads to a local Open-AI compatible server (e.g. `http://localhost:11434/v1` for Ollama or `http://localhost:1234/v1` for LM Studio) using the official `OpenAI` client SDK, keeping downstream code identical.
+Constraints:
+- `status`: `replied` or `escalated` (lowercase)
+- `product_area`: `devplatform`, `claude`, `visa`, or `none`
+- `request_type`: `product_issue`, `feature_request`, `bug`, or `invalid`
+- `risk_level`: `low`, `medium`, `high`, or `critical`
+- `pii_detected`: `true` or `false` (lowercase string)
+- `source_documents`: single relative path string or empty string — never a list
+- `actions_taken`: JSON array string — `[]` when empty, never null
+- `confidence_score`: float 0.60–1.0
 
-### Dynamic Offline Mock Client (`mock`)
-- **Purpose**: Runs the entire test suite and pipeline generation end-to-end in less than a second with zero external dependencies.
-- **Grounded Mock Generator**: Instead of returning static placeholder strings, the mock client extracts the retrieved support documentation and customer ticket text from the LLM prompt. It then dynamically:
-  1. Scores paragraphs from the top retrieved document using keyword overlap.
-  2. Compiles a professional support answer using the most relevant document section.
-  3. Maps customer requests to specific actions (e.g. refund, password reset, lock account, or subscription changes) following rules defined in the internal tools schema.
-  4. Triggers identity verification challenges (`verify_identity`) for destructive requests from unverified users.
-  5. Dynamically decides supervisor escalations using live agent keywords, bug indicators, and document similarity metrics.
+---
 
+## 5. Known Limitations and Observed Failure Modes
+
+These were observed during actual pipeline runs on `sample_support_tickets.csv`:
+
+1. **YAML frontmatter leaking into responses** — Fixed by stripping at index build time. Root cause: Markdown corpus files include `---` YAML headers that BM25 indexed and LLM echoed verbatim.
+
+2. **Generic `support.md` returned for all Visa queries** — Fixed by: (a) adding `support.md` at root level to `EXCLUDED_FILES`, and (b) combining Subject + ticket text as BM25 query. Root cause: The root-level `support.md` had the most tokens overall and superficially matched everything.
+
+3. **Escalation actions silently cleared** — Was `if escalate: actions = []` immediately after generation. Fixed by removing those 3 lines. The post-validation `isinstance(actions, list)` check handles malformed action lists without clearing valid ones.
+
+4. **`verify_identity` on irrelevant tickets** — Was triggered on billing address questions and corporate card config requests. Fixed by tightening the system prompt conditions.
+
+5. **BM25 semantic gap**: BM25 misses relevant articles when the ticket uses different vocabulary (e.g. "terminate" vs "cancel"). Mitigated by retrieving top-5 documents.
+
+6. **Model memory constraints**: The `qwen3.6:latest` model (36B parameters) requires ~20 GiB RAM and may fail to load if system memory is occupied by other processes. Configure `LLM_MODEL` to a smaller model (e.g. `llama3:latest` at 4.7 GB) or switch to `LLM_PROVIDER=groq` in `.env` if this occurs.
+
+---
+
+## 6. Self-Assessment — Where the Hidden Test Set Will Challenge This Agent
+
+- **Novel adversarial patterns**: The safety screener uses a fixed LLM prompt; creative adversarial inputs not in the training distribution may evade detection.
+- **Cross-domain tickets**: A ticket that legitimately spans multiple product areas (e.g. a Visa payment via the DevPlatform API) will be classified into one area and may miss relevant docs from the other.
+- **Non-English tickets**: The BM25 corpus is English-only; non-English tickets get classified and potentially retrieved against English documents, reducing response quality.
+- **Highly specialized Visa/DevPlatform terminology**: BM25 keyword matching fails on domain jargon not present in the corpus (e.g. specific Visa program codes or undocumented API error codes).

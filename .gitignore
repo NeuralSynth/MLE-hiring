@@ -29,3 +29,21 @@ build/
 *.egg-info/
 .pytest_cache/
 /HANDOFF.md
+.benchmarks
+
+# Added by code-review-graph
+.code-review-graph/
+/.claude/
+/.cursor
+.gemini/
+.github/
+.kiro/
+/.qoder/
+/.cursor/
+/.cursorrules
+/.mcp.json
+/.opencode.json
+/.windsurfrules
+/GEMINI.md
+/support_tickets/output_llama3.csv
+/QODER.md
