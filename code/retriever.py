@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 from rank_bm25 import BM25Okapi
@@ -35,9 +36,12 @@ TARGET_WORDS = 220    # accumulate sections up to this; window size when splitti
 MAX_WORDS = 320       # sections above this are window-split (fits embed/BM25 well)
 OVERLAP_WORDS = 30    # carried between windows so facts aren't lost at the seam
 
-# Relevance gate + diversity.
+# Ranking / gate.
 RELATIVE_FLOOR = 0.25      # drop hits scoring below this fraction of the top hit
-MAX_CHUNKS_PER_DOC = 2     # don't let one file fill the whole result set
+MAX_CHUNKS_PER_DOC = 2     # don't let one file fill the result set
+CANDIDATES = 20            # BM25 candidate pool size handed to the semantic re-rank
+BM25_WEIGHT = 0.6          # fusion weights (lexical-leaning: BM25 nails exact terms)
+EMBED_WEIGHT = 0.4
 
 INDEXES = {}
 
@@ -45,11 +49,68 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
 
 
-def _tokenize(text: str) -> list[str]:
+def tokenize(text: str) -> list[str]:
     """Lowercase, split on non-alphanumeric, drop stopwords. Used for both the
     index and the query so matching stays symmetric (and punctuation-proof)."""
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in STOPWORDS]
 
+
+def format_context(chunks: list) -> str:
+    """Render retrieved chunks as a numbered, path-labelled block for an LLM
+    prompt. Shared by the escalation supervisor and the response generator."""
+    return "\n\n".join(
+        f"Document {i + 1} (Path: {doc['path']}):\n{doc['content']}"
+        for i, doc in enumerate(chunks)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional semantic embeddings (model2vec). Everything degrades to pure BM25 if
+# the library/model isn't available or DISABLE_EMBEDDINGS is set.
+# ---------------------------------------------------------------------------
+
+_EMBEDDER = None
+_EMBEDDER_LOADED = False
+
+
+def _get_embedder():
+    global _EMBEDDER, _EMBEDDER_LOADED
+    if _EMBEDDER_LOADED:
+        return _EMBEDDER
+    _EMBEDDER_LOADED = True
+    if os.getenv("DISABLE_EMBEDDINGS"):
+        return None
+    try:
+        from model2vec import StaticModel
+        _EMBEDDER = StaticModel.from_pretrained(os.getenv("EMBED_MODEL", "minishlab/potion-base-8M"))
+    except Exception:
+        _EMBEDDER = None
+    return _EMBEDDER
+
+
+def embed_texts(texts):
+    """Return an (n, d) matrix of L2-normalized embeddings, or None if unavailable."""
+    model = _get_embedder()
+    if model is None:
+        return None
+    try:
+        import numpy as np
+        vecs = np.asarray(model.encode(list(texts)), dtype="float32")
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vecs / norms
+    except Exception:
+        return None
+
+
+def _fuse_score(bm25_norm: float, cosine: float) -> float:
+    """Combine a normalized BM25 score with a (clamped) cosine similarity."""
+    return BM25_WEIGHT * bm25_norm + EMBED_WEIGHT * max(0.0, cosine)
+
+
+# ---------------------------------------------------------------------------
+# Content cleaning + chunking
+# ---------------------------------------------------------------------------
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
     """Return (frontmatter, body). Only treats a leading, newline-delimited
@@ -152,14 +213,14 @@ def _doc_chunks(path: Path) -> list[tuple[str, list[str]]]:
     for section_path, text in _chunk_sections(body):
         prefix = section_path or title
         content = f"{prefix}\n{text}".strip() if prefix else text
-        tokens = _tokenize(f"{content} {enrichment}")
+        tokens = tokenize(f"{content} {enrichment}")
         if tokens:
             out.append((content, tokens))
     return out
 
 
 def build_indexes():
-    """Build a chunk-level BM25 index per product area."""
+    """Build a chunk-level BM25 index (and optional embedding matrix) per area."""
     INDEXES.clear()
     for product, path in CORPUS_PATHS.items():
         if path is None or not path.exists():
@@ -178,37 +239,78 @@ def build_indexes():
                 continue
 
         if tokenized:
-            INDEXES[product] = (BM25Okapi(tokenized), files, contents)
+            embeddings = embed_texts(contents)  # None if the embedder is unavailable
+            INDEXES[product] = (BM25Okapi(tokenized), files, contents, embeddings)
+
+
+def _score_area(area: str, query_tokens: list, query_text: str) -> list:
+    """Rank one area's chunks: BM25 candidate pool, optional semantic re-rank,
+    relative floor. Returns [(fused_score, area, chunk_idx), ...]. Scores are
+    normalized within the area so cross-area results are roughly comparable."""
+    bm25, files, contents, embeddings = INDEXES[area]
+    scores = bm25.get_scores(query_tokens)
+    order = sorted(range(len(files)), key=lambda i: (scores[i], i), reverse=True)
+    candidates = [i for i in order if scores[i] > 0.0][:CANDIDATES]
+    if not candidates:
+        return []
+    top_bm25 = scores[candidates[0]]
+
+    cos = None
+    if embeddings is not None:
+        qv = embed_texts([query_text])
+        if qv is not None:
+            cos = embeddings[candidates] @ qv[0]  # cosine (vectors are L2-normalized)
+
+    fused = []
+    for rank, i in enumerate(candidates):
+        bm_norm = scores[i] / top_bm25 if top_bm25 > 0 else 0.0
+        if cos is not None:
+            fused.append((_fuse_score(bm_norm, float(cos[rank])), area, i))
+        else:
+            fused.append((bm_norm, area, i))
+    fused.sort(key=lambda t: (-t[0], t[2]))
+
+    floor = RELATIVE_FLOOR * fused[0][0]
+    return [t for t in fused if t[0] >= floor and t[0] > 0.0]
+
+
+def _search_all(query_tokens: list, query_text: str, exclude: str = None) -> list:
+    out = []
+    for a in INDEXES:
+        if a == exclude:
+            continue
+        out.extend(_score_area(a, query_tokens, query_text))
+    return out
 
 
 def retrieve(query: str, product_area: str, top_k: int = BM25_TOP_K) -> list[dict]:
-    """Retrieve up to top_k relevant chunks for the query from the product area.
+    """Retrieve up to top_k relevant chunks.
 
-    Applies a relative relevance floor (drops the long tail of marginal hits) and
-    caps chunks per document so one file can't fill the result set."""
+    L3: search the classified area first, but fall back to all areas when the
+    area is unknown / "none" or yields nothing, so a misclassification (or a
+    "none" classification) doesn't blind retrieval. Within an area, BM25 supplies
+    candidates that an optional semantic model re-ranks; a relative floor drops
+    the marginal tail and chunks-per-document are capped."""
     if not INDEXES:
         build_indexes()
 
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return []
+
     area = product_area.strip().lower()
-    if area == "none" or area not in INDEXES:
-        return []
+    if area in INDEXES and area != "none":
+        scored = _score_area(area, query_tokens, query)
+        if not scored:
+            scored = _search_all(query_tokens, query, exclude=area)
+    else:
+        scored = _search_all(query_tokens, query)
 
-    bm25, files, contents = INDEXES[area]
-    tokens = _tokenize(query)
-    if not tokens:
-        return []
-
-    scores = bm25.get_scores(tokens)
-    ranked = sorted(zip(scores, range(len(files))), key=lambda t: (t[0], t[1]), reverse=True)
-    if not ranked or ranked[0][0] <= 0.0:
-        return []
-
-    floor = RELATIVE_FLOOR * ranked[0][0]
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
     results, per_doc = [], {}
-    for score, idx in ranked:
-        if score <= 0.0 or score < floor:
-            break
-        f = files[idx]
+    for score, a, i in scored:
+        _, files, contents, _ = INDEXES[a]
+        f = files[i]
         if per_doc.get(f, 0) >= MAX_CHUNKS_PER_DOC:
             continue
         try:
@@ -216,7 +318,7 @@ def retrieve(query: str, product_area: str, top_k: int = BM25_TOP_K) -> list[dic
         except Exception:
             continue
         per_doc[f] = per_doc.get(f, 0) + 1
-        results.append({"path": rel_path, "content": contents[idx], "score": float(score)})
+        results.append({"path": rel_path, "content": contents[i], "score": round(float(score), 4)})
         if len(results) >= top_k:
             break
     return results

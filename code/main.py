@@ -1,3 +1,9 @@
+from datetime import datetime
+
+start = datetime.now()
+
+print(f"Started at: {start}")
+
 import csv
 import json
 import sys
@@ -14,15 +20,16 @@ sys.path.append(os.path.dirname(__file__))
 from config import TICKETS_PATH, OUTPUT_PATH, MAX_WORKERS
 from retriever import build_indexes, retrieve
 from safety import is_adversarial
-from pii import detect_pii
+from pii import redact_pii
 from classifier import classify
 from escalation import should_escalate
 from generator import generate
 from assembler import assemble
 
 OUTPUT_COLUMNS = [
-    "issue", "subject", "company", "response", "product_area", "status",
-    "request_type", "justification", "confidence_score", "source_documents",
+    "issue", "subject", "company",
+    "response", "product_area", "status", "request_type",
+    "justification", "confidence_score", "source_documents",
     "risk_level", "pii_detected", "language", "actions_taken"
 ]
 
@@ -64,14 +71,20 @@ def fallback_row(row: dict, justification: str = "Escalated due to pipeline proc
 def process_ticket(row: dict) -> dict:
     try:
         ticket_text = extract_text(row.get("Issue", ""))
+        # Stage 2 (PII): detect + redact up front, before any LLM call, so raw
+        # PII never reaches the model (safety/classifier/escalation/generator)
+        # or the output. A redacted copy that differs from the original is the
+        # PII signal itself.
+        redacted_text = redact_pii(ticket_text)
+        pii = redacted_text != ticket_text
         
         # Stage 1: Safety Screener
-        if is_adversarial(ticket_text):
+        if is_adversarial(redacted_text):
             # Assemble immediately as adversarial/escalated
             return assemble(
                 row=row,
                 is_adv=True,
-                pii_detected=False,
+                pii_detected=pii,
                 classification={"product_area": "none", "request_type": "invalid", "risk_level": "low", "language": "en"},
                 escalate=True,
                 escalated_by_rules=True,
@@ -79,27 +92,33 @@ def process_ticket(row: dict) -> dict:
                 ticket_text=ticket_text
             )
             
-        # Stage 2: PII Detection
-        pii = detect_pii(ticket_text)
+        # Stages 3-6 below all run on redacted_text — raw PII is never sent out.
         
         # Stage 3: Classification
-        classification = classify(ticket_text, row.get("Subject", ""), row.get("Company", ""))
+        classification = classify(redacted_text, row.get("Subject", ""), row.get("Company", ""))
         
         # Stage 4: Document Retrieval
+        # Combine Subject + ticket_text for richer BM25 signal (HANDOFF §5 Fix B)
         product_area = classification.get("product_area", "none")
-        chunks = retrieve(ticket_text, product_area)
+        query = f"{row.get('Subject', '')} {ticket_text}".strip()
+        chunks = retrieve(query, product_area)
         
         # Stage 5: Escalation Gate
-        escalate, escalated_by_rules = should_escalate(
+        escalate, escalated_by_rules, esc_reason = should_escalate(
             classification.get("risk_level", "low"),
             pii,
-            ticket_text,
+            redacted_text,
             classification.get("product_area", "none"),
-            chunks
+            chunks,
+            classification.get("request_subtype", ""),
         )
         
         # Stage 6: Response Generation
-        generated = generate(ticket_text, chunks, escalate)
+        generated = generate(redacted_text, chunks, escalate)
+
+        # G6: the generator escalates a reply it could not resolve from the docs.
+        if generated.get("escalated") and not escalate:
+            escalate, escalated_by_rules, esc_reason = True, False, "generator_unresolved"
         
         # Stage 7: Output Assembly
         return assemble(
@@ -110,7 +129,8 @@ def process_ticket(row: dict) -> dict:
             escalate=escalate,
             escalated_by_rules=escalated_by_rules,
             generated=generated,
-            ticket_text=ticket_text
+            ticket_text=ticket_text,
+            escalation_reason=esc_reason,
         )
     except Exception as e:
         # Fallback to avoid crashes
@@ -143,6 +163,11 @@ def main():
         writer.writerows(results)
         
     print("Done!")
+
+    end = datetime.now()
+
+    print(f"Finished at: {end}")
+    print(f"Total runtime: {end - start}")
 
 if __name__ == "__main__":
     main()
