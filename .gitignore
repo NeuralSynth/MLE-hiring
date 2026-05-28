@@ -46,4 +46,5 @@ build/
 /.windsurfrules
 /GEMINI.md
 /support_tickets/output_llama3.csv
+/support_tickets/output.partial.csv
 /QODER.md

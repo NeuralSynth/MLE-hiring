@@ -47,6 +47,7 @@ Then set **one** provider in `.env`. Supported providers:
 | **Groq** | `LLM_PROVIDER=groq`<br>`GROQ_API_KEY=...` | `llama-3.3-70b-versatile` | Fast hosted inference — recommended for a quick full run. |
 | **Anthropic** | `LLM_PROVIDER=anthropic`<br>`ANTHROPIC_API_KEY=...` | `claude-3-5-sonnet-20241022` | |
 | **OpenAI** | `LLM_PROVIDER=openai`<br>`OPENAI_API_KEY=...` | `gpt-4o-mini` | |
+| **Gemini** | `LLM_PROVIDER=gemini`<br>`GOOGLE_API_KEY=...` | `gemini-2.5-flash` | Uses `google-genai` SDK; implicit prompt caching on 2.5+ models. |
 
 Example `.env` for Groq:
 
@@ -76,7 +77,15 @@ This will:
 3. For each ticket: PII redaction → safety screen → classification → retrieval →
    escalation decision → response/tool generation → output assembly.
 4. Process tickets concurrently (`MAX_WORKERS`, default 5).
-5. Write the results to `support_tickets/output.csv` with all required columns.
+5. Stream each completed row to `support_tickets/output.partial.csv` as a
+   checkpoint; on clean completion, sort by input order and write
+   `support_tickets/output.csv`.
+
+> **Resume on restart.** If the run is interrupted (`Ctrl+C`, OOM, provider
+> 5xx, OS kill), re-running `python code/main.py` reads the partial file
+> and continues from the next unprocessed ticket. Use `FORCE_RESTART=1
+> python code/main.py` to discard the partial and start fresh. See
+> [`ARCHITECTURE.md` §17](./ARCHITECTURE.md#17-checkpoint--resume) for details.
 
 ---
 
@@ -131,13 +140,14 @@ agent always runs.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `LLM_PROVIDER` | `ollama` | `ollama` / `groq` / `anthropic` / `openai` |
+| `LLM_PROVIDER` | `ollama` | `ollama` / `groq` / `anthropic` / `openai` / `gemini` |
 | `LLM_MODEL` | — | model id for the chosen provider |
-| `GROQ_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | provider API keys |
+| `GROQ_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` | — | provider API keys |
 | `LOCAL_LLM_URL` / `LOCAL_LLM_KEY` | `http://localhost:11434/v1` | Ollama endpoint / dummy key |
 | `MAX_WORKERS` | `5` | concurrent ticket workers |
 | `EMBED_MODEL` | `minishlab/potion-base-8M` | semantic re-rank model |
 | `DISABLE_EMBEDDINGS` | unset | set to force pure-BM25 retrieval |
+| `FORCE_RESTART` | unset | set to `1` to discard `output.partial.csv` and re-process every ticket |
 
 ---
 

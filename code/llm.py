@@ -33,6 +33,9 @@ class LLMClient:
             return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         elif self.provider == "openai":
             return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        elif self.provider == "gemini":
+            from google import genai
+            return genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
         else:
             raise ValueError(f"Unknown LLM provider: {self.provider}")
 
@@ -85,6 +88,21 @@ class LLMClient:
                 messages=[{"role": "user", "content": user}],
             )
             return message.content[0].text.strip()
+        elif self.provider == "gemini":
+            # Prompt caching: Gemini supports implicit caching on 2.5+ models
+            # (Flash / Pro) for prefixes above the model's minimum size — no
+            # API parameter required, the platform detects and reuses cached
+            # prefixes automatically. Explicit caching via client.caches.create
+            # exists for heavier reuse patterns but is overkill here.
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=user,
+                config={
+                    "system_instruction": system,
+                    "temperature": 0,
+                },
+            )
+            return (response.text or "").strip()
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 

@@ -38,6 +38,7 @@ the alternatives**, **what it improves over a naive baseline**, and the
 14. [Testing strategy](#14-testing-strategy)
 15. [Known limitations & failure modes](#15-known-limitations--failure-modes)
 16. [Decisions considered and rejected](#16-decisions-considered-and-rejected)
+17. [Checkpoint & resume](#17-checkpoint--resume)
 
 ---
 
@@ -209,11 +210,11 @@ Each component below uses the same template:
     use.
   - *Provider-native SDK at each call site*: rejected. Couples every stage to
     one provider and prevents the local-vs-hosted toggle.
-- **Limitations.** The `google`/`gemini` provider is documented in
-  `.env.example` but **not wired** — calling `LLM_PROVIDER=google` raises
-  `ValueError` (limitation #2 in §15). Anthropic uses a different `messages`
-  shape than the OpenAI-compatible providers; the client handles both, but
-  it is two code paths to keep in sync.
+- **Limitations.** Anthropic uses a different `messages` shape than the
+  OpenAI-compatible providers, and Gemini uses a third shape
+  (`models.generate_content` with `system_instruction` in a `config` dict);
+  the client handles all three, but that is three code paths to keep in
+  sync.
 
 ### 5.2 PII detection + redaction — `pii.py`
 
@@ -833,15 +834,15 @@ replied totals stable.
 
 ## 13. Configuration
 
-| Env var                                                 | Default                    | Purpose                                    |
-|---------------------------------------------------------|----------------------------|--------------------------------------------|
-| `LLM_PROVIDER`                                          | `ollama`                   | `ollama` / `groq` / `anthropic` / `openai` |
-| `LLM_MODEL`                                             | —                          | model id for the provider                  |
-| `GROQ_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | —                          | provider keys                              |
-| `LOCAL_LLM_URL` / `LOCAL_LLM_KEY`                       | `localhost:11434/v1`       | Ollama endpoint                            |
-| `MAX_WORKERS`                                           | `5`                        | concurrency for ticket processing          |
-| `EMBED_MODEL`                                           | `minishlab/potion-base-8M` | semantic re-rank model                     |
-| `DISABLE_EMBEDDINGS`                                    | unset                      | set to force pure-BM25 retrieval           |
+| Env var                                                                    | Default                    | Purpose                                               |
+|----------------------------------------------------------------------------|----------------------------|-------------------------------------------------------|
+| `LLM_PROVIDER`                                                             | `ollama`                   | `ollama` / `groq` / `anthropic` / `openai` / `gemini` |
+| `LLM_MODEL`                                                                | —                          | model id for the provider                             |
+| `GROQ_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` | —                          | provider keys                                         |
+| `LOCAL_LLM_URL` / `LOCAL_LLM_KEY`                                          | `localhost:11434/v1`       | Ollama endpoint                                       |
+| `MAX_WORKERS`                                                              | `5`                        | concurrency for ticket processing                     |
+| `EMBED_MODEL`                                                              | `minishlab/potion-base-8M` | semantic re-rank model                                |
+| `DISABLE_EMBEDDINGS`                                                       | unset                      | set to force pure-BM25 retrieval                      |
 
 ---
 
@@ -874,14 +875,13 @@ replied totals stable.
 | # | Limitation                                                                                                | Impact                                                                                                                                                                 | Mitigation / status                                                                            |
 |--:|-----------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
 | 1 | No end-to-end accuracy benchmark yet                                                                      | Confidence in real-world accuracy is unverified beyond the 147 unit/integration tests + structural validation                                                          | Re-run on hidden test set and iterate on observed misses                                       |
-| 2 | Provider gap — Google/Gemini is referenced in `.env.example` & README but **not wired** in `llm.py`       | `LLM_PROVIDER=google` would raise `ValueError`                                                                                                                         | Documented; trivial to add a branch when/if needed                                             |
-| 3 | `model2vec` is *sufficient, not ideal* — static embeddings trail contextual bi- / cross-encoders          | Some synonyms still slip past the re-rank                                                                                                                              | Pluggable: one-function swap to `fastembed`+`bge-small` (ONNX, no torch) or a cross-encoder    |
-| 4 | **L3 residual** — a wrong-area ticket with a *weak* lexical match doesn't trigger the cross-area fallback | Misclassified-area tickets may return marginal in-area docs                                                                                                            | Stage-5 weak-retrieval rule (top chunk covers <15% of ticket terms) is the backstop            |
-| 5 | **PII recall gaps** — undashed SSNs, non-US phone groupings, names                                        | Those values aren't redacted; can reach the LLM and the output                                                                                                         | Deliberate precision/recall trade-off (loose patterns over-redact); opt-in extensions possible |
-| 6 | Keyword rules can't read intent ("I'm *not* going to sue" still trips the legal rule)                     | Some legitimate tickets over-escalate                                                                                                                                  | Safe-failure (escalation, not refusal) keeps it harmless                                       |
-| 7 | Cross-domain tickets — a ticket spanning two product areas is classified into one                         | May miss relevant docs from the other corpus                                                                                                                           | L3 fallback + weak-retrieval rule partially compensate                                         |
-| 8 | Non-English answers — the corpus is English-only                                                          | Lower answer quality for non-English tickets even when classified / retrieved correctly                                                                                | A multilingual embedder could close some of the gap (deferred)                                 |
-| 9 | LLM non-determinism on the supervisor's borderline cases                                                  | A few borderline tickets can flip reply↔escalate between runs (we observed `#8` "none of the submissions working" flip between troubleshoot-reply and outage-escalate) | `temperature=0` minimizes the variance; structural decisions around the LLM call are fixed     |
+| 2 | `model2vec` is *sufficient, not ideal* — static embeddings trail contextual bi- / cross-encoders          | Some synonyms still slip past the re-rank                                                                                                                              | Pluggable: one-function swap to `fastembed`+`bge-small` (ONNX, no torch) or a cross-encoder    |
+| 3 | **L3 residual** — a wrong-area ticket with a *weak* lexical match doesn't trigger the cross-area fallback | Misclassified-area tickets may return marginal in-area docs                                                                                                            | Stage-5 weak-retrieval rule (top chunk covers <15% of ticket terms) is the backstop            |
+| 4 | **PII recall gaps** — undashed SSNs, non-US phone groupings, names                                        | Those values aren't redacted; can reach the LLM and the output                                                                                                         | Deliberate precision/recall trade-off (loose patterns over-redact); opt-in extensions possible |
+| 5 | Keyword rules can't read intent ("I'm *not* going to sue" still trips the legal rule)                     | Some legitimate tickets over-escalate                                                                                                                                  | Safe-failure (escalation, not refusal) keeps it harmless                                       |
+| 6 | Cross-domain tickets — a ticket spanning two product areas is classified into one                         | May miss relevant docs from the other corpus                                                                                                                           | L3 fallback + weak-retrieval rule partially compensate                                         |
+| 7 | Non-English answers — the corpus is English-only                                                          | Lower answer quality for non-English tickets even when classified / retrieved correctly                                                                                | A multilingual embedder could close some of the gap (deferred)                                 |
+| 8 | LLM non-determinism on the supervisor's borderline cases                                                  | A few borderline tickets can flip reply↔escalate between runs (we observed `#8` "none of the submissions working" flip between troubleshoot-reply and outage-escalate) | `temperature=0` minimizes the variance; structural decisions around the LLM call are fixed     |
 
 ---
 
@@ -890,18 +890,95 @@ replied totals stable.
 Transparency on what was on the table during the hardening pass — so a
 reviewer can see the design space, not just the chosen point.
 
-| Considered                                                                | Decision                                                                                       | Why                                                                                                                                                                            |
-|---------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Heavy framework (LangChain / LlamaIndex)                                  | **Rejected**                                                                                   | Their abstractions don't fit the rules-first design; adds dependencies for features unused here.                                                                               |
-| Pure vector DB (no BM25)                                                  | **Rejected**                                                                                   | Loses exact-term precision on error codes / IDs / product names; adds an ANN engine to the dep surface.                                                                        |
-| Always-on cross-area soft-prior retrieval                                 | **Rejected** in favour of the minimal L3 fallback                                              | Preserves in-area precision for the common case; the residual (wrong area with some lexical match) is handled by the Stage-5 weak-retrieval rule.                              |
-| Cross-encoder semantic re-rank (sentence-transformers + torch)            | **Deferred**                                                                                   | `model2vec` is sufficient over BM25 candidates; integration is pluggable, so the swap is a one-function change when measured quality warrants it.                              |
-| PII recall extensions (undashed SSNs, non-US phone groupings, names)      | **Deferred**                                                                                   | Looser patterns over-redact and over-escalate via Rule 3; the precision/recall trade-off is the right call for now.                                                            |
-| Trimming the tool schema in the generator prompt                          | **Rejected**                                                                                   | Token cost is negligible at 89 tickets; the descriptions/enums materially improve tool-call accuracy.                                                                          |
-| `ollama_cloud` provider                                                   | Drafted, then **rejected mid-implementation** (user decision)                                  | The provider gap (Google/Gemini not wired) is documented as limitation #2 instead.                                                                                             |
-| Intent classifier for "I'm *not* suing"-style negations                   | **Deferred**                                                                                   | The safe-failure mode (escalate) keeps the false positive harmless; adding an intent layer here would cost an LLM call per ticket for marginal accuracy gain.                  |
-| LLM-reported `confidence_score`                                           | **Rejected**                                                                                   | Every observed model returns the same number regardless of evidence; a deterministic ladder correlates with the actual outcome.                                                |
-| Function-calling / tool-use API (replace post-validation with provider's) | **Rejected**                                                                                   | Loses provider portability; weaker against required-parameter omissions; current G1 validation is provider-agnostic.                                                           |
+| Considered                                                                | Decision                                                      | Why                                                                                                                                                                              |
+|---------------------------------------------------------------------------|---------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Heavy framework (LangChain / LlamaIndex)                                  | **Rejected**                                                  | Their abstractions don't fit the rules-first design; adds dependencies for features unused here.                                                                                 |
+| Pure vector DB (no BM25)                                                  | **Rejected**                                                  | Loses exact-term precision on error codes / IDs / product names; adds an ANN engine to the dep surface.                                                                          |
+| Always-on cross-area soft-prior retrieval                                 | **Rejected** in favour of the minimal L3 fallback             | Preserves in-area precision for the common case; the residual (wrong area with some lexical match) is handled by the Stage-5 weak-retrieval rule.                                |
+| Cross-encoder semantic re-rank (sentence-transformers + torch)            | **Deferred**                                                  | `model2vec` is sufficient over BM25 candidates; integration is pluggable, so the swap is a one-function change when measured quality warrants it.                                |
+| PII recall extensions (undashed SSNs, non-US phone groupings, names)      | **Deferred**                                                  | Looser patterns over-redact and over-escalate via Rule 3; the precision/recall trade-off is the right call for now.                                                              |
+| Trimming the tool schema in the generator prompt                          | **Rejected**                                                  | Token cost is negligible at 89 tickets; the descriptions/enums materially improve tool-call accuracy.                                                                            |
+| `ollama_cloud` provider                                                   | Drafted, then **rejected mid-implementation** (user decision) | Keeping the provider list to the four production-supported SDKs (Ollama / Groq / Anthropic / OpenAI / Gemini) avoids a fifth code path the rest of the pipeline never exercises. |
+| Intent classifier for "I'm *not* suing"-style negations                   | **Deferred**                                                  | The safe-failure mode (escalate) keeps the false positive harmless; adding an intent layer here would cost an LLM call per ticket for marginal accuracy gain.                    |
+| LLM-reported `confidence_score`                                           | **Rejected**                                                  | Every observed model returns the same number regardless of evidence; a deterministic ladder correlates with the actual outcome.                                                  |
+| Function-calling / tool-use API (replace post-validation with provider's) | **Rejected**                                                  | Loses provider portability; weaker against required-parameter omissions; current G1 validation is provider-agnostic.                                                             |
+
+---
+
+---
+
+## 17. Checkpoint & resume
+
+A batch of 89 tickets at up to 4 LLM calls each is minutes-to-hours of work.
+Any interruption — `Ctrl+C`, Ollama VRAM stall, hosted-provider 5xx, OS kill —
+used to wipe the entire run because the original `executor.map → DictWriter`
+flow only wrote `output.csv` after *every* ticket finished. Checkpointing makes
+re-runs resume from where they stopped.
+
+### 17.1 Mechanism
+
+| Component              | Implementation                                                                                                                                                                                      |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Checkpoint file**    | `support_tickets/output.partial.csv` — same 14-column schema as `output.csv`, with one leading metadata line: `# CHECKPOINT input_hash=<16hex> llm_provider=<str> llm_model=<str>`.                 |
+| **Granularity**        | Per-ticket. Tickets are the natural atomic unit of work — independent of each other, deterministic given input + model. A crash mid-ticket re-runs just that ticket on resume.                      |
+| **Ticket key**         | `sha256(Issue + Subject + Company)[:16]` — stable, computable from the existing input columns (no extra column written into the partial).                                                           |
+| **Write path**         | `executor.submit` + `as_completed`. Each worker takes a `threading.Lock`, appends its row to the partial file, and flushes. Every row that hits disk survives a crash.                              |
+| **Resume**             | On startup, if the partial exists, read its rows, build the set of processed ticket keys, and skip those input rows. Only the remainder is sent to workers.                                         |
+| **Order preservation** | Streaming writes land in completion order. On clean completion, `_finalize()` re-reads the partial, sorts rows by input order, writes `output.csv`, and deletes the partial.                        |
+| **Torn-row recovery**  | `csv.DictReader` returns `None` for missing fields on a short row (possible after a hard crash mid-write). `_load_partial` drops any row missing one or more columns so the ticket is re-processed. |
+
+### 17.2 Behavior matrix
+
+| Situation                                             | Outcome                                                                                                                                                                   |
+|-------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| First run, completes cleanly                          | Streams to partial → sorts → writes `output.csv` → deletes partial.                                                                                                       |
+| Run crashes at ticket 50                              | Tickets 1–49 sit on disk in `output.partial.csv`; `output.csv` is untouched.                                                                                              |
+| Restart after that crash                              | Reads partial → skips 49 processed tickets → processes 40 remaining → sorts → writes `output.csv`.                                                                        |
+| **Input CSV changed** between runs                    | `_input_hash(TICKETS_PATH)` differs from `partial_meta["input_hash"]` → **`sys.exit(1)` with a clear message** telling the user to revert the input or `FORCE_RESTART=1`. |
+| **`LLM_PROVIDER` / `LLM_MODEL` changed** between runs | **Warning** printed showing partial vs. current; run **continues**. Output will contain rows from both models — the warning makes that visible.                           |
+| User wants a fresh run                                | `FORCE_RESTART=1 python code/main.py` — the partial is deleted before resume logic runs.                                                                                  |
+| Provider-side row torn by hard crash                  | Dropped on read; that ticket is re-processed. (Empty strings in legit columns are kept — only structurally short rows are dropped.)                                       |
+
+### 17.3 Why these specific choices
+
+- **Per-ticket, not per-stage.** Per-stage checkpointing would save more LLM
+  work on a mid-ticket crash, but it requires serializing partial state
+  (classification dict, retrieved chunks, intermediate prompts), versioning
+  that state across code changes, and reasoning about its invalidation.
+  Per-ticket recovers ~99% of the value at ~10% of the complexity.
+- **Hard fail on input mismatch.** A changed input CSV means the partial's
+  ticket keys no longer correspond to what we'd compute now — silently
+  continuing would produce a CSV that mixes results from two different
+  inputs without any warning at the row level. Hard fail forces an explicit
+  decision.
+- **Soft warn on model mismatch.** Changing model between runs is a common
+  workflow when iterating on prompts or comparing providers — blocking it
+  would be friction. The warning makes the mixed-model output visible
+  without forcing intervention.
+- **CSV-with-comment-line over JSON sidecar.** A single file is easier to
+  inspect, delete, and version-ignore than two files that must stay in
+  sync. The leading `# CHECKPOINT` line is a one-line read on startup.
+- **Streaming writes + sort at end, not in-order writes.** Writing in
+  completion order keeps workers from blocking on each other (no in-order
+  barrier). Sorting 89 rows in memory at the end is trivially cheap.
+
+### 17.4 Limitations
+
+| # | Limitation                                                             | Mitigation / note                                                                                 |
+|--:|------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| 1 | One in-flight ticket is lost on a crash and re-run on resume           | Acceptable — 1 ticket of work, not the whole batch.                                               |
+| 2 | Two concurrent `main.py` runs against the same partial would clobber   | Not handled; documented. Don't run two instances against the same `output.partial.csv`.           |
+| 3 | A torn write *within* a single CSV line (e.g. power-loss during fsync) | Mitigated by drop-on-short-row logic in `_load_partial`. Beyond that, the ticket is re-processed. |
+| 4 | Mixed-model output after a soft-warn provider/model swap               | Visible in the printed warning; user can choose to `FORCE_RESTART=1` instead.                     |
+
+### 17.5 Test coverage
+
+`code/tests/test_checkpoint.py` — **13 tests** covering: ticket-key stability
+across input/output row shapes, input-hash determinism, partial round-trip,
+torn-row recovery, missing-metadata-line backward compat, input-order
+sort + missing-row backfill at finalize, `sys.exit(1)` on input-hash mismatch,
+end-to-end resume against `sample_support_tickets.csv`, and `FORCE_RESTART=1`
+discarding an otherwise-valid partial. All run in <3s with the LLM mocked.
 
 ---
 

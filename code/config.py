@@ -13,6 +13,9 @@ CORPUS_PATHS = {
 API_SPECS_DIR = DATA_DIR / "api_specs"
 TICKETS_PATH = ROOT / "support_tickets" / "support_tickets.csv"
 OUTPUT_PATH = ROOT / "support_tickets" / "output.csv"
+# Checkpoint file written incrementally per ticket; renamed to OUTPUT_PATH on
+# clean completion. Survives crashes so re-runs resume from where they stopped.
+PARTIAL_OUTPUT_PATH = ROOT / "support_tickets" / "output.partial.csv"
 
 import os
 
