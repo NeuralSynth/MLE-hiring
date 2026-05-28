@@ -9,8 +9,8 @@ env/
 # Environment
 .env
 
-#tests
-code/tests/
+##tests
+#code/tests/
 
 # IDE
 .vscode/

@@ -8,18 +8,17 @@ from retriever import tokenize, format_context
 MIN_TOKENS_FOR_COVERAGE = 4
 WEAK_COVERAGE = 0.15
 
-ESCALATION_SYSTEM_PROMPT = """You are a customer support supervisor. Your job is to decide whether a customer support ticket should be escalated to a human agent, or if it can be resolved automatically using the provided support documentation.
+ESCALATION_SYSTEM_PROMPT = """You are a customer support supervisor. The ticket has cleared all hard safety/compliance rules; you are deciding the ambiguous case: REPLY using the provided documentation, or ESCALATE to a human.
 
-Escalate if:
-- The customer is highly frustrated, angry, abusive, or explicitly demands to speak to a supervisor, manager, or human agent.
-- The request requires account changes, settings, or database operations that are not described or permitted in the help documents.
-- The ticket refers to a suspected bug, system failure, service outage, or technical error that cannot be resolved by standard customer troubleshooting.
-- The request is out-of-scope or there is no clear documentation to resolve the issue.
+Default to REPLY whenever the documentation contains an answer to the customer's question — even if the docs are not a perfect literal match. Most support tickets can be answered from the corpus: how-to instructions, FAQs, policies, troubleshooting steps, and process descriptions are all valid bases for a reply. Reply with what the documentation says, even if it only addresses part of the question.
 
-You are also given a triage risk level. Treat a "high" or "critical" risk level as a strong reason to escalate unless the documentation clearly and completely resolves the issue.
-You are also given the request type; treat sensitive types such as "privacy" or "billing" with extra caution before resolving automatically.
+ESCALATE only when ONE of the following is clearly true:
+- The customer is genuinely frustrated, angry, abusive, or explicitly asks for a human, supervisor, or manager.
+- The request requires performing an action or making a decision the agent cannot do from documentation alone (e.g. issuing a refund, modifying account state, restoring access, banning a user, completing a form on the customer's behalf), AND the documentation does not describe a self-serve path the customer can follow.
+- The ticket reports a confirmed bug, system outage, or service failure that requires engineering attention.
+- The documentation provided does not address the customer's question at all (genuinely out of scope).
 
-Otherwise, if the provided help documents cover the exact issue and can resolve it, output "reply".
+You are also given a triage risk level and request type for context. These DO NOT by themselves justify escalation — a "high"-risk or "privacy"/"billing"-subtype ticket whose answer is in the documentation should still be REPLIED to.
 
 Output only one word: escalate or reply.
 """

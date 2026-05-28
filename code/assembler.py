@@ -75,7 +75,7 @@ def assemble(
     
     # 2. Determine justification
     if is_adv:
-        justification = "Adversarial prompt injection attempt detected by the safety screener. Escalated immediately for safety."
+        justification = "Adversarial input detected by the safety screener (prompt injection or social-engineering / manipulation attempt). Escalated immediately for safety."
         status = "escalated"
         request_type = "invalid"
         response = "This request cannot be processed."
