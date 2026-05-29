@@ -27,7 +27,25 @@ PATTERNS = {
         r"\b\d{1,6}\s+(?:" + _STREET_NAME + r"\s+){1,4}" + _STREET_TYPES + r"\b\.?"
     ),
     # City, State ZIP (e.g. Springfield, IL 62704)
-    "address_zip": re.compile(r"\b[A-Za-z\s\-.']+,\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b")
+    "address_zip": re.compile(r"\b[A-Za-z\s\-.']+,\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"),
+    # IPv4 with strict per-octet 0–255 validation, so "1.2.3.999" doesn't match.
+    "ip_address": re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"
+    ),
+    # Undashed SSN ONLY when a context word ("SSN" / "social security") is
+    # within 15 chars of the 9-digit run. Avoids the false positives a bare
+    # 9-digit run would create on order IDs, tracking numbers, etc.
+    # The bounded lazy filler `.{0,15}?` accepts short intervening text like
+    # " is ", ": ", " number ", " was " between the context word and digits.
+    "ssn_with_context": re.compile(
+        r"\b(?:SSN|social\s*security(?:\s*number)?)\b.{0,15}?\b\d{9}\b",
+        re.IGNORECASE
+    ),
+    # API keys / secret tokens. Format: sk- or pk- prefix + 20+ chars, which
+    # covers OpenAI (sk-...), Anthropic (sk-ant-...), Stripe (sk_live_... /
+    # pk_live_...). 20-char minimum prevents matching ordinary text starting
+    # with "sk-" or "pk-".
+    "api_key": re.compile(r"\b(?:sk|pk)[_-][A-Za-z0-9_-]{20,}\b"),
 }
 
 def check_luhn(card_str: str) -> bool:
@@ -64,11 +82,14 @@ def _scrub(text: str) -> str:
     before phones so a card's digits are never read as a phone number. Shared by
     detect_pii and redact_pii so the flag and the masking can never disagree."""
     text = PATTERNS["email"].sub("[EMAIL]", text)
+    text = PATTERNS["api_key"].sub("[API_KEY]", text)  # before card so sk_/pk_ tokens aren't reread as digits
     text = PATTERNS["credit_card_raw"].sub(_mask_card, text)
+    text = PATTERNS["ssn_with_context"].sub("[SSN]", text)  # contextual undashed SSN before dashed (more specific)
     text = PATTERNS["ssn"].sub("[SSN]", text)
     text = PATTERNS["phone"].sub(_mask_phone, text)
     text = PATTERNS["address_street"].sub("[ADDRESS]", text)
     text = PATTERNS["address_zip"].sub("[ADDRESS]", text)
+    text = PATTERNS["ip_address"].sub("[IP]", text)
     return text
 
 
