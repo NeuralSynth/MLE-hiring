@@ -29,7 +29,11 @@ def test_generator_returns_required_keys():
     assert "actions_taken" in result
     assert "source_documents" in result
 
-def test_actions_taken_is_valid_json():
+def test_generator_returns_actions_taken_as_list():
+    """Unit check: generate() returns actions_taken as a list (parseable as
+    JSON either way). Distinct from the pipeline-level same-name check in
+    test_pipeline.py — see also: that test asserts every row across the
+    end-to-end run is JSON-valid."""
     result = generate(ticket_text="How do I delete my account?", chunks=SAMPLE_CHUNKS, escalate=False)
     parsed = json.loads(result["actions_taken"]) if isinstance(result["actions_taken"], str) else result["actions_taken"]
     assert isinstance(parsed, list)
