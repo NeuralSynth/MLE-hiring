@@ -34,6 +34,25 @@ _LEGAL_RE = _compile(LEGAL_KEYWORDS)
 _HUMAN_RE = _compile(HUMAN_REQUEST_KEYWORDS)
 _FINANCIAL_RE = _compile(FINANCIAL_WORDS)
 
+# Signals that a short out-of-scope ticket is actually a real support concern
+# (account, billing, security, etc.) rather than something benign like "what
+# time is it?" or "are you a bot?". When ANY of these appear, escalate per
+# the original Rule 4. When none appear, the ticket can get a polite OOS
+# reply instead — preserving the safe-failure mode for anything resembling a
+# real issue while letting the easy cases be replied to.
+_REAL_CONCERN_RE = re.compile(
+    r"\b(?:"
+    r"help|support|issue|problem|broken|stuck|won'?t|cannot|"
+    r"error|crash|failed|failure|"
+    r"refund|charge|charged|payment|invoice|bill|billing|transaction|"
+    r"account|password|login|signin|sign\s*in|access|locked|"
+    r"cancel|delete|reset|lock|modify|upgrade|downgrade|"
+    r"security|hack|breach|fraud|stolen|compromise|leak|"
+    r"data|privacy|gdpr|export"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _llm_escalation_check(ticket_text: str, retrieved_chunks: list, risk_level: str,
                           pii_detected: bool, request_subtype: str = "") -> bool:
@@ -82,9 +101,17 @@ def should_escalate(
     if pii_detected and _FINANCIAL_RE.search(ticket_text):
         return True, True, "pii_financial"
 
-    # Rule 4: vague, out-of-scope request with no product area.
+    # Rule 4: vague / out-of-scope request with no product area.
+    # Split into two paths based on whether the short ticket has any signal of
+    # a real support concern. Tickets with such signals still escalate (safer);
+    # truly benign short tickets ("what time is it?", "are you a bot?") return
+    # `oos_polite_reply` so main.py can route them to a deterministic OOS
+    # template — replying with clarification rather than escalating wastes
+    # less of the human reviewer's time.
     if product_area == "none" and len(ticket_text.split()) < 20:
-        return True, True, "vague_out_of_scope"
+        if _REAL_CONCERN_RE.search(ticket_text):
+            return True, True, "vague_out_of_scope"
+        return False, False, "oos_polite_reply"
 
     # Rule 5: no corpus documents matched at all.
     if not retrieved_chunks:

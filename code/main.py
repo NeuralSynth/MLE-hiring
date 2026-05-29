@@ -200,6 +200,32 @@ def process_ticket(row: dict) -> dict:
             classification.get("request_subtype", ""),
         )
 
+        # Stage 5a: out-of-scope polite reply — short, no product area, no
+        # signal of a real concern. Deterministic template; no LLM call.
+        if esc_reason == "oos_polite_reply":
+            return assemble(
+                row=row,
+                is_adv=False,
+                pii_detected=pii,
+                classification=classification,
+                escalate=False,
+                escalated_by_rules=False,
+                generated={
+                    "response": (
+                        "I'm a support agent for DevPlatform, Claude, and Visa topics. "
+                        "I'm not able to help with that — but I can help with account, "
+                        "billing, technical, or general support questions for those products. "
+                        "What can I help you with?"
+                    ),
+                    "actions_taken": [],
+                    "source_documents": "",
+                    "escalated": False,
+                    "grounding": {"top_overlap": 0.0, "source_count": 0},
+                },
+                ticket_text=ticket_text,
+                escalation_reason="oos_polite_reply",
+            )
+
         # Stage 6: Response Generation
         generated = generate(redacted_text, chunks, escalate)
 
