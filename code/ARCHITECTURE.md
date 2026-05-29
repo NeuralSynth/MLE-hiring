@@ -380,7 +380,7 @@ Each stage below uses the same template:
 
 **Limitations.**
 - 10 fine request types collapse to 4 coarse ones in the output schema. Granularity is internal.
-- Company is passed as a hint ("infer from content, not from company") but on truly ambiguous tickets the LLM occasionally over-weights it.
+- The Company field is used as a **fallback** when ticket content is too vague to classify on its own (short messages, payment / order IDs without product context, ambiguous account questions). A clear content signal still wins over Company — a Visa-card question with `Company=Claude` classifies as `visa` — but a vague ticket with an explicit Company avoids the `product_area="none"` trap that previously dropped tickets like row 6 (payment ticket with `cs_live_…` order ID + `Company=DevPlatform`). `none` now requires BOTH content and Company to be silent.
 
 ### 6.5 Retriever
 

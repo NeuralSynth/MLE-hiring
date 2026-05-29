@@ -110,3 +110,22 @@ def test_total_garbage_falls_back(monkeypatch):
         "risk_level": "low",
         "language": "en",
     }
+
+
+# --- Prompt-pinning: the company-fallback rule must stay in the system prompt ---
+
+def test_classifier_prompt_falls_back_to_company_when_vague():
+    """Pin the system-prompt language that fixes Row 6 (payment ticket with
+    order ID + Company=DevPlatform getting product_area='none'). The
+    classifier MUST instruct the LLM to fall back to the Company field when
+    ticket content alone is too vague to classify."""
+    from classifier import CLASSIFIER_SYSTEM_PROMPT
+    text = CLASSIFIER_SYSTEM_PROMPT.lower()
+    # Fallback rule is present.
+    assert "fall back" in text or "fallback" in text
+    # Company field is named explicitly as the fallback source.
+    assert "company field" in text
+    # All three company-to-area mappings are spelled out.
+    assert "devplatform" in text and "claude" in text and "visa" in text
+    # The "none" guard is preserved: only when content AND company are silent.
+    assert '"none"' in text or "'none'" in text

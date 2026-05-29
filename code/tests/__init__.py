@@ -21,13 +21,24 @@ from pathlib import Path
 # Only run the import sweep when imported as a package (i.e. by pytest).
 # Skipped when this file is run as a script via `python __init__.py`,
 # which falls through to run_tests() at the bottom.
+#
+# We mirror `from <module> import *` semantics here (respect __all__ if
+# defined, otherwise export every public name) rather than filtering on
+# `test_*` / `Test*` prefixes alone. Fixtures (e.g. `sample_rows`,
+# `processed_results` in test_pipeline.py) don't follow that prefix
+# convention but ARE needed by the tests that consume them — without
+# them, those tests collect-but-error with "fixture not found" when
+# pytest is invoked against this __init__.py directly.
 if __name__ != "__main__":
     _here = Path(__file__).parent
     for _path in sorted(_here.glob("test_*.py")):
         _module = importlib.import_module(f"{__name__}.{_path.stem}")
-        for _name in dir(_module):
-            if _name.startswith("test_") or _name.startswith("Test"):
-                globals()[_name] = getattr(_module, _name)
+        if hasattr(_module, "__all__"):
+            _names = _module.__all__
+        else:
+            _names = [n for n in dir(_module) if not n.startswith("_")]
+        for _name in _names:
+            globals()[_name] = getattr(_module, _name)
 
 
 def run_tests():

@@ -31,7 +31,11 @@ LANGUAGE_NAMES = {
 }
 
 CLASSIFIER_SYSTEM_PROMPT = """You are a ticket classifier. Output only valid JSON matching this exact schema.
-The Company field in the ticket is a hint only — infer product_area from ticket content, not from the Company field.
+
+How to use the Company field:
+- When the ticket content gives a CLEAR product signal, follow the content and ignore the Company field. A Visa card question with Company=Claude is still product_area="visa".
+- When the ticket content is too vague to classify on its own (short or generic messages, payment / order IDs without explicit product context, ambiguous account or billing questions, single-sentence complaints), fall back to the Company field as a signal: DevPlatform -> devplatform, Claude -> claude, Visa -> visa.
+- Only return product_area="none" when BOTH the content gives no product signal AND the Company field is "None" or absent. A vague ticket with a real Company value should NOT be "none".
 
 Schema:
 {
