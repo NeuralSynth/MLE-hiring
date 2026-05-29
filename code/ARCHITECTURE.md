@@ -1,6 +1,6 @@
 # Support Triage Agent — Architecture
 
-A multi-domain customer-support triage agent for the MLE hiring challenge.
+A multi-domain customer-support triage agent.
 For every ticket, the agent decides whether the request can be answered
 automatically from the local documentation corpus or needs a human, makes
 any required tool calls, and writes a fully-structured CSV row that the
@@ -718,7 +718,7 @@ Measured on the shipped corpus and a CPU dev machine.
 | Per-ticket local work         | sub-ms BM25 + ~ms embedding (LLM dominates)                                |
 | LLM calls / ticket            | up to 4 (safety, classify, supervisor, generate); fewer via short-circuits |
 | Tickets                       | 89 (`support_tickets.csv`), processed across `MAX_WORKERS` (default 5)     |
-| Test suite                    | **191 tests**, ~3 s (LLM mocked; embeddings disabled in suite)             |
+| Test suite                    | **192 tests**, ~3 s (LLM mocked; embeddings disabled in suite)             |
 
 ### Observed outcomes on the 89-ticket shipped run
 
@@ -774,7 +774,7 @@ escalations, +3 adversarial flags (all on tickets that should be flagged —
 
 ## 15. Testing
 
-**191 tests** across nine files, all pass in ~3 s with the LLM mocked and
+**192 tests** across ten files, all pass in ~3 s with the LLM mocked and
 embeddings disabled in the suite (the `conftest.py` does both).
 
 | File                 |   Tests | Coverage focus                                                                                                                                                             |
@@ -785,11 +785,11 @@ embeddings disabled in the suite (the `conftest.py` does both).
 | `test_generator.py`  |      22 | Action validation, citation membership + disk, multi-source backfill (G2b), escalate-action injection, empty-response backfill, G6 flip, `verify_identity` enforcement     |
 | `test_escalation.py` |      21 | Whole-word rules, first-word verdict, reason codes, weak-retrieval, OOS split, supervisor "default to reply"                                                               |
 | `test_assembler.py`  |      16 | Continuous confidence ladder (overlap/source bumps), reason-keyed justification, row shape + enums, adversarial overrides                                                  |
-| `test_classifier.py` |      14 | Per-field coercion, preamble robustness, ISO language normalization, fine → coarse mapping, garbage fallback                                                               |
+| `test_classifier.py` |      15 | Per-field coercion, preamble robustness, ISO language normalization, fine → coarse mapping, garbage fallback, company-fallback prompt pin                                  |
 | `test_checkpoint.py` |      13 | Ticket key stability, input-hash mismatch, resume, torn-row recovery, `FORCE_RESTART`                                                                                      |
 | `test_pipeline.py`   |      10 | End-to-end on sample tickets, adversarial routing, OOS routing, benign-OOS polite reply                                                                                    |
 | `test_llm.py`        |       7 | `clean_json_response` (think-tag / fences / preamble / braces-in-strings), provider init paths                                                                             |
-| **Total**            | **191** | ~3 s; LLM mocked; embeddings disabled                                                                                                                                      |
+| **Total**            | **192** | ~3 s; LLM mocked; embeddings disabled                                                                                                                                      |
 
 ---
 
@@ -928,7 +928,7 @@ I know coverage isn't perfect.
 | 4 | Source Attribution            |    10% |      8 | Pipe-separated multi-path per schema. G2 validates each path on disk; G2b backfills with measurable grounding. Conservative — never fabricates, may under-attribute on aggressive paraphrase. |
 | 5 | Tool Calling                  |    10% |    7.5 | G1 schema validation + identity-gate enforcement in code. Tool selection is LLM-driven. No conversation-history check for prior identity (FP risk too high).                                  |
 | 6 | PII Handling                  |    10% |      7 | Format-preserving redaction before any LLM call; Luhn-validated cards. Gap G added IP / contextual SSN / API keys. Recall conservative by design.                                             |
-| 7 | Architecture & Code Quality   |    10% |    8.5 | Clear stage separation, every choice documented with rationale + alternatives, 191 tests, full reproducibility.                                                                               |
+| 7 | Architecture & Code Quality   |    10% |    8.5 | Clear stage separation, every choice documented with rationale + alternatives, 192 tests, full reproducibility.                                                                               |
 | 8 | Confidence Calibration        |     5% |    6.5 | Continuous on grounded rung; the rest is rule-based. No learned calibrator.                                                                                                                   |
 | 9 | Determinism & Reproducibility |     5% |    9.5 | `temperature=0`, deterministic gates, pinned embeddings, order-stable thread pool, checkpoint reproducibility.                                                                                |
 

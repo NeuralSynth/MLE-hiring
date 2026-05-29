@@ -92,7 +92,7 @@ This will:
 > provider 5xx, OS kill), re-running `python code/main.py` reads the
 > partial file and continues from the next unprocessed ticket. Use
 > `FORCE_RESTART=1 python code/main.py` to discard the partial and
-> start fresh. See [`ARCHITECTURE.md` §17](./ARCHITECTURE.md#17-checkpoint--resume)
+> start fresh. See [`ARCHITECTURE.md` §18](./ARCHITECTURE.md#18-checkpoint--resume)
 > for details.
 
 ---
@@ -114,7 +114,7 @@ not correctness). Passing validation is necessary but not sufficient.
 python -m pytest code/tests -q
 ```
 
-**191 tests** covering every stage, ~3 s. The LLM is mocked and
+**192 tests** covering every stage, ~3 s. The LLM is mocked and
 embeddings are disabled in the suite (via `conftest.py`), so the suite
 runs **offline, fast, and deterministically** — no API key or model
 download required.
@@ -172,7 +172,7 @@ code/
 ├── assembler.py       # final row + continuous confidence ladder
 ├── validate_output.py # output format validator
 ├── config.py          # paths, constants, keyword lists
-├── tests/             # 191 tests (LLM mocked, offline)
+├── tests/             # 192 tests (LLM mocked, offline)
 ├── ARCHITECTURE.md    # full design, trade-offs, benchmarks, self-assessment
 └── README.md          # this file
 ```
