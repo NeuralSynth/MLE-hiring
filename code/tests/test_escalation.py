@@ -147,3 +147,39 @@ def test_supervisor_escalates_a_confirmed_outage(monkeypatch):
         "high", False, "Claude has stopped working completely, all requests are failing",
         "claude", chunks)
     assert esc is True and by_rules is False and reason == "supervisor_llm"
+
+
+# --- Gap E: Rule 4 split — benign OOS replies politely, concerning OOS still escalates ---
+
+def test_benign_oos_returns_polite_reply_not_escalate():
+    """Short ticket with no product area AND no signal of a real concern
+    routes to oos_polite_reply (reply path), not escalation."""
+    esc, by_rules, reason = should_escalate("low", False, "what time is it", "none", [])
+    assert esc is False
+    assert by_rules is False
+    assert reason == "oos_polite_reply"
+
+
+def test_benign_oos_are_you_a_bot():
+    esc, by_rules, reason = should_escalate("low", False, "are you a bot", "none", [])
+    assert (esc, by_rules, reason) == (False, False, "oos_polite_reply")
+
+
+def test_short_oos_with_concern_still_escalates():
+    """Short OOS ticket but mentions a real support concern (refund / account /
+    security / etc.) — preserves the original Rule 4 safe-failure behavior."""
+    for text in [
+        "I want a refund",                # financial concern
+        "my account is locked",           # account concern
+        "I think my data is leaked",      # security concern
+        "the error keeps happening",      # broken concern
+    ]:
+        esc, by_rules, reason = should_escalate("low", False, text, "none", [])
+        assert esc is True, f"expected escalation for: {text!r}"
+        assert by_rules is True
+        # Note: Rule 5 (no_docs) fires before Rule 4 if chunks=[]; ensure we
+        # really hit vague_out_of_scope by giving a chunk.
+    # And one more with chunks present to specifically prove Rule 4 escalates:
+    chunks = [{"content": "x", "path": "x.md", "score": 0.5}]
+    esc, by_rules, reason = should_escalate("low", False, "I want a refund", "none", chunks)
+    assert esc is True and by_rules is True and reason == "vague_out_of_scope"

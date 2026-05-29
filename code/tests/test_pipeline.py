@@ -81,3 +81,17 @@ def test_out_of_scope_ticket():
     }
     result = process_ticket(oos_row)
     assert result["product_area"] == "none" or result["status"] == "escalated"
+
+
+def test_benign_oos_routes_to_polite_reply():
+    """Gap E: short benign OOS ticket should be REPLIED (not escalated) with
+    the deterministic OOS clarification template — no LLM call."""
+    benign = {
+        "Issue": '[{"role": "user", "content": "what time is it"}]',
+        "Subject": "",
+        "Company": "None"
+    }
+    result = process_ticket(benign)
+    assert result["status"] == "replied"
+    assert "I'm a support agent" in result["response"]
+    assert "Out of scope" in result["justification"]
