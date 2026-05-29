@@ -126,3 +126,188 @@ def test_verify_identity_not_duplicated(monkeypatch):
     _stub(monkeypatch, '{"response":"ok","actions_taken":[{"action":"verify_identity","parameters":{"method":"email_otp","target":"x"}},{"action":"reset_password","parameters":{"user_email":"[EMAIL]"}}],"source_documents":""}')
     names = [a["action"] for a in generate("reset my password", REAL_CHUNKS, False)["actions_taken"]]
     assert names.count("verify_identity") == 1
+
+
+# --- G2b: deterministic citation backfill when the LLM omits / mangles the path ---
+
+# Two real chunks whose paths exist on disk, used to drive the backfill picker.
+G2B_CHUNKS = [
+    {
+        "path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+        "content": "The exchange rate calculator lets you convert amounts between currencies for travel planning.",
+        "score": 0.92,
+    },
+    {
+        "path": "data/devplatform/settings/account-settings.md",
+        "content": "To delete your account, go to Settings then Account then Delete Account.",
+        "score": 0.55,
+    },
+]
+
+
+def test_g2b_backfills_when_llm_omits_citation_and_response_overlaps_chunk(monkeypatch):
+    """LLM emits empty source but the response is measurably grounded in one of
+    the chunks — backfill attributes that chunk's path."""
+    _stub(monkeypatch,
+          '{"response":"Use the exchange rate calculator to convert currencies for travel planning.",'
+          '"actions_taken":[],"source_documents":""}')
+    out = generate("how do I convert money", G2B_CHUNKS, False)
+    assert out["source_documents"] == "data/visa/support/consumer/travel-support/exchange-rate-calculator.md"
+
+
+def test_g2b_stays_empty_when_response_does_not_overlap(monkeypatch):
+    """Generic / templated response with no content overlap → no false attribution."""
+    _stub(monkeypatch, '{"response":"Thanks for reaching out, we appreciate your patience.","actions_taken":[],"source_documents":""}')
+    out = generate("any question", G2B_CHUNKS, False)
+    assert out["source_documents"] == ""
+
+
+def test_g2b_does_not_override_valid_llm_citation(monkeypatch):
+    """LLM cited a valid path. Even if another chunk overlaps the response more,
+    the LLM's choice is preserved (G2b only fires when source_doc is empty)."""
+    _stub(monkeypatch,
+          '{"response":"To delete your account go to settings then account then delete account.",'
+          '"actions_taken":[],"source_documents":"data/devplatform/settings/account-settings.md"}')
+    out = generate("delete my account", G2B_CHUNKS, False)
+    assert out["source_documents"] == "data/devplatform/settings/account-settings.md"
+
+
+def test_g2b_never_fires_on_escalate_path(monkeypatch):
+    """Escalate path: source_documents must stay empty even if a chunk overlaps the response."""
+    _stub(monkeypatch,
+          '{"response":"Escalating to a human; exchange rate calculator info is not applicable here.",'
+          '"actions_taken":[],"source_documents":""}')
+    out = generate("anything", G2B_CHUNKS, True)
+    assert out["source_documents"] == ""
+
+
+def test_g2b_does_not_fire_after_g6_flip(monkeypatch):
+    """G6: ungrounded 'I cannot answer; please escalate' reply that happens to
+    share tokens with a chunk. G6 flips to escalated and G2b respects that —
+    source stays empty."""
+    _stub(monkeypatch,
+          '{"response":"I cannot answer this question about the exchange rate calculator from the docs; please escalate.",'
+          '"actions_taken":[],"source_documents":""}')
+    out = generate("how do I convert money", G2B_CHUNKS, False)
+    assert out["escalated"] is True
+    assert out["source_documents"] == ""
+
+
+def test_g2b_uses_retriever_score_as_tiebreaker(monkeypatch):
+    """Two chunks with similar overlap: BOTH are attributed (multi-source per
+    the schema), but the higher-scored chunk comes FIRST in the pipe-separated
+    output."""
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "alpha beta gamma delta epsilon zeta eta theta", "score": 0.30},
+        {"path": "data/devplatform/settings/account-settings.md",
+         "content": "alpha beta gamma delta epsilon zeta eta theta", "score": 0.90},
+    ]
+    _stub(monkeypatch,
+          '{"response":"alpha beta gamma delta epsilon zeta eta theta","actions_taken":[],"source_documents":""}')
+    out = generate("q", chunks, False)
+    # Same overlap (1.0 both) — both attributed; higher-scored chunk first.
+    assert out["source_documents"] == (
+        "data/devplatform/settings/account-settings.md"
+        "|data/visa/support/consumer/travel-support/exchange-rate-calculator.md"
+    )
+
+
+def test_g2b_returns_empty_for_short_response(monkeypatch):
+    """Responses with fewer than 3 content tokens are too short to attribute."""
+    _stub(monkeypatch, '{"response":"ok","actions_taken":[],"source_documents":""}')
+    out = generate("q", G2B_CHUNKS, False)
+    assert out["source_documents"] == ""
+
+
+# --- Gap A: pipe-separated multi-source attribution ---
+
+def test_g2_keeps_multiple_valid_pipe_separated_paths(monkeypatch):
+    """LLM cited two valid paths pipe-separated — both must be preserved. G2
+    checks each path exists on disk, so this test uses two real corpus files."""
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "x", "score": 0.5},
+        {"path": "data/claude/amazon-bedrock/7996918-what-is-amazon-bedrock.md",
+         "content": "y", "score": 0.4},
+    ]
+    _stub(monkeypatch,
+          '{"response":"see both docs","actions_taken":[],'
+          '"source_documents":"data/visa/support/consumer/travel-support/exchange-rate-calculator.md|data/claude/amazon-bedrock/7996918-what-is-amazon-bedrock.md"}')
+    out = generate("q", chunks, False)
+    assert out["source_documents"] == (
+        "data/visa/support/consumer/travel-support/exchange-rate-calculator.md"
+        "|data/claude/amazon-bedrock/7996918-what-is-amazon-bedrock.md"
+    )
+
+
+def test_g2_drops_invalid_paths_keeps_valid_in_pipe_separated(monkeypatch):
+    """LLM cited two paths, one invalid: only the valid one survives, the
+    invalid one is dropped without collapsing the whole field to empty."""
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "x", "score": 0.5},
+    ]
+    _stub(monkeypatch,
+          '{"response":"see the calculator","actions_taken":[],'
+          '"source_documents":"README.md|data/visa/support/consumer/travel-support/exchange-rate-calculator.md"}')
+    out = generate("q", chunks, False)
+    assert out["source_documents"] == "data/visa/support/consumer/travel-support/exchange-rate-calculator.md"
+
+
+def test_g2_collapses_to_empty_when_all_paths_invalid(monkeypatch):
+    """Every cited path invalid → field collapses to "" → G2b may then backfill
+    or stay empty. Here the response doesn't overlap, so it stays empty."""
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "exchange rate calculator", "score": 0.5},
+    ]
+    _stub(monkeypatch,
+          '{"response":"general thanks for your patience","actions_taken":[],'
+          '"source_documents":"README.md|nonexistent.md"}')
+    out = generate("q", chunks, False)
+    assert out["source_documents"] == ""
+
+
+def test_g2b_backfills_all_overlapping_chunks_pipe_separated(monkeypatch):
+    """LLM emits empty, response overlaps TWO chunks — both should be attributed
+    pipe-separated, ranked by combined score."""
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "exchange rate calculator currencies travel", "score": 0.40},
+        {"path": "data/devplatform/settings/account-settings.md",
+         "content": "delete account settings exchange currencies", "score": 0.80},
+    ]
+    # Response uses tokens from BOTH chunks.
+    _stub(monkeypatch,
+          '{"response":"Use the exchange rate calculator and settings to manage currencies for travel.",'
+          '"actions_taken":[],"source_documents":""}')
+    out = generate("q", chunks, False)
+    paths = out["source_documents"].split("|")
+    assert len(paths) == 2
+    # Both real corpus paths in the output (order is by combined score).
+    assert "data/visa/support/consumer/travel-support/exchange-rate-calculator.md" in paths
+    assert "data/devplatform/settings/account-settings.md" in paths
+
+
+def test_g2b_caps_attribution_at_three_chunks(monkeypatch):
+    """If more than _MAX_BACKFILL_CHUNKS chunks overlap, only the top 3 are kept."""
+    # All four chunks share the exact response tokens, so each has overlap=1.0;
+    # ranking falls to retriever_score; only the top 3 should be attributed.
+    chunks = [
+        {"path": "data/visa/support/consumer/travel-support/exchange-rate-calculator.md",
+         "content": "alpha beta gamma delta", "score": 0.90},
+        {"path": "data/devplatform/settings/account-settings.md",
+         "content": "alpha beta gamma delta", "score": 0.80},
+        {"path": "data/claude/amazon-bedrock/7996918-what-is-amazon-bedrock.md",
+         "content": "alpha beta gamma delta", "score": 0.70},
+        {"path": "data/claude/claude-api-and-console/troubleshooting/8114490-where-can-i-find-your-api-documentation.md",
+         "content": "alpha beta gamma delta", "score": 0.60},
+    ]
+    _stub(monkeypatch,
+          '{"response":"alpha beta gamma delta","actions_taken":[],"source_documents":""}')
+    out = generate("q", chunks, False)
+    paths = out["source_documents"].split("|")
+    assert len(paths) == 3  # capped at _MAX_BACKFILL_CHUNKS
+    # The lowest-scored chunk (0.60) must NOT appear.
+    assert "data/claude/claude-api-and-console/troubleshooting/8114490-where-can-i-find-your-api-documentation.md" not in paths

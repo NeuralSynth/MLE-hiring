@@ -13,6 +13,7 @@ ESCALATION_JUSTIFICATIONS = {
     "weak_retrieval": "Escalated automatically: the available documentation does not sufficiently cover this request.",
     "supervisor_llm": "Escalated by supervisor assessment: the request exceeds automated capabilities or requires manual verification.",
     "generator_unresolved": "Escalated: the request could not be resolved from the available support documentation.",
+    "oos_polite_reply": "Out of scope: the request is outside the support topics this agent covers. Replied with a clarification of what the agent can help with.",
 }
 _DEFAULT_ESCALATION = "Escalated by supervisor assessment because the request exceeds automated capabilities or requires manual verification."
 
@@ -24,11 +25,25 @@ def calculate_confidence(
     product_area: str,
     language: str,
     source_documents: str,
-    ticket_text: str
+    ticket_text: str,
+    top_overlap: float = 0.0,
+    source_count: int = 0,
 ) -> float:
-    # A correct, grounded answer is the most confident outcome.
+    # A correct, grounded answer is the most confident outcome. Rather than a
+    # flat 0.95 the score is now CONTINUOUS in [0.80, 0.97], driven by:
+    #   - top_overlap: response-token recall on the strongest cited chunk
+    #     (direct grounding evidence)
+    #   - source_count: how many distinct chunks were cited (diversifies sources)
+    # This spreads confidence across many distinct values so the Brier metric
+    # can actually distinguish well-grounded answers from barely-grounded ones,
+    # instead of the prior 5-rung ladder which the rubric flags as flat.
     if not is_adv and not escalated and request_type != "invalid" and source_documents:
-        return 0.95
+        base = 0.80
+        overlap_bump = min(0.10, max(0.0, top_overlap) * 0.25)  # 0.40 overlap -> +0.10
+        count_bump = min(0.05, max(0, source_count - 1) * 0.025)  # +0.025 per extra source, cap +0.05
+        score = base + overlap_bump + count_bump
+        # Cap below 1.0 — never claim certainty (Brier penalizes over-confident wrong).
+        return round(min(0.97, max(0.80, score)), 2)
 
     # Confident *decisions* that are rejections, not resolutions.
     if is_adv:
@@ -83,13 +98,20 @@ def assemble(
         source_docs = ""
     elif escalate:
         justification = ESCALATION_JUSTIFICATIONS.get(escalation_reason, _DEFAULT_ESCALATION)
+    elif escalation_reason == "oos_polite_reply":
+        # Replied (not escalated), but with a specific reason: out-of-scope.
+        justification = ESCALATION_JUSTIFICATIONS["oos_polite_reply"]
     else:
         if source_docs:
-            justification = f"Answered from the support corpus using document: {source_docs}."
+            # source_docs may be pipe-separated for multi-chunk attributions.
+            paths = source_docs.split("|")
+            noun = "document" if len(paths) == 1 else "documents"
+            justification = f"Answered from the support corpus using {noun}: {source_docs}."
         else:
             justification = "Answered using general support guidance. No specific documentation matching all parameters was found."
 
     # 3. Calculate confidence score
+    grounding = generated.get("grounding", {}) or {}
     confidence = calculate_confidence(
         is_adv=is_adv,
         escalated=escalate,
@@ -98,7 +120,9 @@ def assemble(
         product_area=product_area,
         language=language,
         source_documents=source_docs,
-        ticket_text=ticket_text
+        ticket_text=ticket_text,
+        top_overlap=float(grounding.get("top_overlap", 0.0)),
+        source_count=int(grounding.get("source_count", 0)),
     )
     
     # 4. Serialize Actions Taken to valid JSON string
