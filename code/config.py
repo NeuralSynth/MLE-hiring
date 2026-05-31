@@ -20,7 +20,10 @@ PARTIAL_OUTPUT_PATH = ROOT / "support_tickets" / "output.partial.csv"
 import os
 
 LLM_TEMPERATURE = 0
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
+# Recommended minimum 8: benchmarked across {2,3,5,8,10,12,15,18}, only 8
+# completed the 89-ticket set within the 3-min limit (0:02:32). See
+# ARCHITECTURE.md §13 (worker-count tuning).
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 8))
 BM25_TOP_K = 5
 
 # Legal / compliance language — always escalate (must be handled by a human).

@@ -240,6 +240,52 @@ def _best_grounded_chunks(response: str, chunks: list) -> str:
     return "|".join(paths)
 
 
+# 4a: deterministic routing for rule-decided escalations. When should_escalate
+# returns escalated_by_rules=True the outcome is already fixed, so the escalation
+# message adds no information — we template it and skip the LLM call entirely
+# (faster, and fully deterministic). reason -> (department, priority); department
+# and priority are constrained to the escalate_to_human schema enums.
+_RULE_ESCALATION_ROUTING = {
+    "critical_risk": ("general", "urgent"),
+    "legal_terms": ("legal", "high"),
+    "human_request": ("general", "normal"),
+    "pii_financial": ("billing", "high"),
+    "vague_out_of_scope": ("general", "low"),
+    "no_docs": ("general", "normal"),
+    "weak_retrieval": ("general", "normal"),
+}
+
+_RULE_ESCALATION_SUMMARIES = {
+    "critical_risk": "Ticket triaged as critical risk; routed to a human for review.",
+    "legal_terms": "Legal or compliance language detected; routed to the legal team.",
+    "human_request": "Customer explicitly requested a human agent or supervisor.",
+    "pii_financial": "Personal data combined with a financial request; requires manual identity verification.",
+    "vague_out_of_scope": "Request too vague or out of scope to resolve from the support documentation.",
+    "no_docs": "No matching support documentation was found for this request.",
+    "weak_retrieval": "Available documentation does not sufficiently cover this request.",
+}
+
+
+def rule_escalation(reason: str) -> dict:
+    """Deterministic escalation result for a rule-based escalation (no LLM call).
+
+    Returns the same shape as generate(): a templated escalation message plus a
+    single escalate_to_human action whose department/priority are derived from
+    the escalation reason. Used by main.py when escalated_by_rules is True."""
+    department, priority = _RULE_ESCALATION_ROUTING.get(reason, ("general", "normal"))
+    summary = _RULE_ESCALATION_SUMMARIES.get(reason, "Escalated to a human specialist for review.")
+    return {
+        "response": _DEFAULT_ESCALATE_RESPONSE,
+        "actions_taken": [{
+            "action": "escalate_to_human",
+            "parameters": {"priority": priority, "department": department, "summary": summary},
+        }],
+        "source_documents": "",
+        "escalated": True,
+        "grounding": {"top_overlap": 0.0, "source_count": 0},
+    }
+
+
 def _fallback(escalate: bool) -> dict:
     if escalate:
         return {

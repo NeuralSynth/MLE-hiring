@@ -85,7 +85,7 @@ This will:
 1. Build the chunk-level BM25 index over `data/` (and, if `model2vec` is installed, the embedding matrix for the semantic re-rank).
 2. Read and parse tickets from `support_tickets/support_tickets.csv`.
 3. For each ticket: PII redaction → safety screen → classification → retrieval → escalation decision → response/tool generation → output assembly.
-4. Process tickets concurrently (`MAX_WORKERS`, default 5).
+4. Process tickets concurrently (`MAX_WORKERS`, default 8 — see [Performance](#8-performance--worker-count)).
 5. Stream each completed row to `support_tickets/output.partial.csv` as a checkpoint; on clean completion, sort by input order and write `support_tickets/output.csv`.
 
 > **Resume on restart.** If the run is interrupted (Ctrl+C, OOM,
@@ -114,7 +114,7 @@ not correctness). Passing validation is necessary but not sufficient.
 python -m pytest code/tests -q
 ```
 
-**192 tests** covering every stage, ~3 s. The LLM is mocked and
+**203 tests** covering every stage, ~3 s. The LLM is mocked and
 embeddings are disabled in the suite (via `conftest.py`), so the suite
 runs **offline, fast, and deterministically** — no API key or model
 download required.
@@ -150,14 +150,40 @@ BM25 — the agent always runs.
 | `LLM_MODEL` | — | model id for the chosen provider |
 | `GROQ_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` | — | provider API keys |
 | `LOCAL_LLM_URL` / `LOCAL_LLM_KEY` | `http://localhost:11434/v1` | Ollama endpoint / dummy key |
-| `MAX_WORKERS` | `5` | concurrent ticket workers |
+| `MAX_WORKERS` | `8` | concurrent ticket workers (recommended minimum — see [Performance](#8-performance--worker-count)) |
 | `EMBED_MODEL` | `minishlab/potion-base-8M` | semantic re-rank model |
 | `DISABLE_EMBEDDINGS` | unset | set to force pure-BM25 retrieval |
 | `FORCE_RESTART` | unset | set to `1` to discard `output.partial.csv` and re-process every ticket |
 
 ---
 
-## 8. Layout
+## 8. Performance & worker count
+
+The pipeline must process the full ticket set within a **3-minute** limit.
+Per-ticket local work is sub-millisecond, so wall-clock is dominated by LLM
+round-trips and the right `MAX_WORKERS` is whatever keeps the LLM backend
+busy without overloading it.
+
+We benchmarked eight worker counts against the **89-ticket**
+`support_tickets.csv` on the evaluated LLM backend:
+
+| `MAX_WORKERS` | 89-ticket wall-clock | Within 3-min limit? |
+|--------------:|----------------------|:-------------------:|
+| 2 / 3 / 5     | ≥ 5 min              | ✗                   |
+| **8**         | **0:02:32.461436**   | **✓**               |
+| 10 / 12 / 15 / 18 | ≥ 5 min          | ✗                   |
+
+**`MAX_WORKERS=8` is the recommended minimum and the default.** It is the
+only value that finished within the limit — **0:02:32.461436** for all 89
+tickets, ~27 s of headroom under 3 minutes. Fewer workers under-utilize
+concurrency; more than 8 degrade throughput because the LLM backend
+serializes concurrent requests. Every other count we tested was ≥ 5 minutes.
+These numbers are specific to the benchmarked provider/model — re-sweep if
+you change backends. See `ARCHITECTURE.md` §13 for the full table.
+
+---
+
+## 9. Layout
 
 ```
 code/
@@ -172,7 +198,7 @@ code/
 ├── assembler.py       # final row + continuous confidence ladder
 ├── validate_output.py # output format validator
 ├── config.py          # paths, constants, keyword lists
-├── tests/             # 192 tests (LLM mocked, offline)
+├── tests/             # 203 tests (LLM mocked, offline)
 ├── ARCHITECTURE.md    # full design, trade-offs, benchmarks, self-assessment
 └── README.md          # this file
 ```

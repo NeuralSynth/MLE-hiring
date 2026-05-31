@@ -1,6 +1,6 @@
 import json
 import pytest
-from generator import generate
+from generator import generate, rule_escalation, _RULE_ESCALATION_ROUTING
 
 SAMPLE_CHUNKS = [
     {
@@ -315,3 +315,59 @@ def test_g2b_caps_attribution_at_three_chunks(monkeypatch):
     assert len(paths) == 3  # capped at _MAX_BACKFILL_CHUNKS
     # The lowest-scored chunk (0.60) must NOT appear.
     assert "data/claude/claude-api-and-console/troubleshooting/8114490-where-can-i-find-your-api-documentation.md" not in paths
+
+
+# --- 4a: deterministic rule-based escalation (no LLM call) ---
+
+# Mirrors the escalate_to_human schema in data/api_specs/internal_tools.json.
+_VALID_DEPARTMENTS = {"billing", "technical", "security", "legal", "general"}
+_VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
+
+
+def test_rule_escalation_shape_and_schema():
+    """rule_escalation returns the generate() shape with a schema-valid
+    escalate_to_human action, empty sources, and escalated=True."""
+    out = rule_escalation("legal_terms")
+    assert set(out) == {"response", "actions_taken", "source_documents", "escalated", "grounding"}
+    assert out["escalated"] is True
+    assert out["source_documents"] == ""
+    assert out["response"]  # non-empty message
+    actions = out["actions_taken"]
+    assert len(actions) == 1 and actions[0]["action"] == "escalate_to_human"
+    params = actions[0]["parameters"]
+    assert set(params) >= {"priority", "department", "summary"}
+    assert params["department"] in _VALID_DEPARTMENTS
+    assert params["priority"] in _VALID_PRIORITIES
+    assert params["summary"]
+
+
+@pytest.mark.parametrize("reason", list(_RULE_ESCALATION_ROUTING))
+def test_rule_escalation_routing_is_schema_valid(reason):
+    """Every routed reason maps to enum-valid department/priority."""
+    params = rule_escalation(reason)["actions_taken"][0]["parameters"]
+    assert params["department"] in _VALID_DEPARTMENTS
+    assert params["priority"] in _VALID_PRIORITIES
+
+
+def test_rule_escalation_specific_routes():
+    """Spot-check the reasons whose routing carries real meaning."""
+    assert rule_escalation("legal_terms")["actions_taken"][0]["parameters"]["department"] == "legal"
+    assert rule_escalation("critical_risk")["actions_taken"][0]["parameters"]["priority"] == "urgent"
+    assert rule_escalation("pii_financial")["actions_taken"][0]["parameters"]["department"] == "billing"
+
+
+def test_rule_escalation_unknown_reason_falls_back():
+    """An unmapped reason still yields a valid, neutral escalation."""
+    params = rule_escalation("some_future_reason")["actions_taken"][0]["parameters"]
+    assert params["department"] == "general"
+    assert params["priority"] == "normal"
+
+
+def test_rule_escalation_makes_no_llm_call(monkeypatch):
+    """The whole point of 4a: no LLM is invoked. Stub complete() to explode."""
+    from llm import llm
+    def _boom(system, user):
+        raise AssertionError("rule_escalation must not call the LLM")
+    monkeypatch.setattr(llm, "complete", _boom)
+    out = rule_escalation("no_docs")  # must not raise
+    assert out["escalated"] is True

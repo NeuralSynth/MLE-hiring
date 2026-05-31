@@ -26,7 +26,7 @@ from safety import is_adversarial
 from pii import redact_pii
 from classifier import classify
 from escalation import should_escalate
-from generator import generate
+from generator import generate, rule_escalation
 from assembler import assemble
 
 OUTPUT_COLUMNS = [
@@ -227,11 +227,17 @@ def process_ticket(row: dict) -> dict:
             )
 
         # Stage 6: Response Generation
-        generated = generate(redacted_text, chunks, escalate)
+        # 4a: a rule-decided escalation has a fixed outcome, so skip the LLM and
+        # use a deterministic escalation template. The generator only runs for
+        # replies and for the ambiguous (supervisor-LLM) escalations.
+        if escalate and escalated_by_rules:
+            generated = rule_escalation(esc_reason)
+        else:
+            generated = generate(redacted_text, chunks, escalate)
 
-        # G6: the generator escalates a reply it could not resolve from the docs.
-        if generated.get("escalated") and not escalate:
-            escalate, escalated_by_rules, esc_reason = True, False, "generator_unresolved"
+            # G6: the generator escalates a reply it could not resolve from the docs.
+            if generated.get("escalated") and not escalate:
+                escalate, escalated_by_rules, esc_reason = True, False, "generator_unresolved"
 
         # Stage 7: Output Assembly
         return assemble(
